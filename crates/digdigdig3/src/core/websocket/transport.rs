@@ -1239,6 +1239,12 @@ impl<P: WsProtocol> DriverTask<P> {
         let raw: Value = match msg {
             WsFrame::Text(text) => {
                 trace_raw_frame(exchange, "text", text.as_bytes());
+                // Some venues send an empty text frame at connect / heartbeat
+                // edges (e.g. OKX). Not valid JSON, nothing to route — skip
+                // silently instead of warn-spam.
+                if text.trim().is_empty() {
+                    return Ok(true);
+                }
                 match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(e) => {
