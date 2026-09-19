@@ -407,8 +407,20 @@ fn parse_trade(raw: &Value) -> WebSocketResult<StreamEvent> {
 
 fn parse_orderbook(raw: &Value) -> WebSocketResult<StreamEvent> {
     let data = frame_data(raw)?;
-    BitgetParser::parse_ws_orderbook_delta(data)
-        .map_err(|e| WebSocketError::Parse(e.to_string()))
+    let symbol = raw
+        .get("arg")
+        .and_then(|a| a.get("instId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut event = BitgetParser::parse_ws_orderbook_delta(data)
+        .map_err(|e| WebSocketError::Parse(e.to_string()))?;
+    // The booksN orderbook payload has no instId in its data element — carry the
+    // symbol from the frame's `arg.instId` so OrderbookSnapshot is routable.
+    if let StreamEvent::OrderbookSnapshot { symbol: ref mut sym, .. } = event {
+        *sym = symbol;
+    }
+    Ok(event)
 }
 
 fn parse_kline(raw: &Value) -> WebSocketResult<StreamEvent> {

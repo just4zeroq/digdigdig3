@@ -450,6 +450,10 @@ fn build_spot_registry() -> TopicRegistry {
         .register(StreamKind::Ticker, at, "tickers", parse_tickers)
         .register(StreamKind::Trade, at, "trades", parse_trades)
         .register(StreamKind::Trade, at, "trades-all", parse_trades)
+        // AggTrade maps to the same "trades" channel (OKX has no separate aggTrade).
+        // parse_agg_trades emits StreamEvent::AggTrade from the same wire frame;
+        // dispatch_all fires both Trade and AggTrade parsers per frame.
+        .register(StreamKind::AggTrade, at, "trades", parse_agg_trades)
         .register(StreamKind::Orderbook, at, "books", parse_books)
         .register(StreamKind::Orderbook, at, "books5", parse_books)
         .register(StreamKind::Orderbook, at, "bbo-tbt", parse_books)
