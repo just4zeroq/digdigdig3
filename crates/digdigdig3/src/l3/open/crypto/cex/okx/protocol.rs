@@ -14,7 +14,8 @@ use crate::core::rt::WsFrame;
 use crate::core::traits::Credentials;
 use crate::core::types::{AccountType, StreamEvent, TradeSide, WebSocketError, WebSocketResult};
 use crate::core::websocket::{
-    KlineInterval, StreamKind, StreamSpec, TopicKey, TopicRegistry, WsProtocol,
+    BatchGrammar, KlineInterval, StreamKind, StreamSpec, TopicKey, TopicRegistry, WsProtocol,
+    envelope_args,
 };
 use crate::core::{encode_base64, hmac_sha256, timestamp_iso8601};
 use crate::core::types::OrderbookDelta as OrderbookDeltaType;
@@ -171,6 +172,36 @@ impl OkxProtocol {
         };
         Some(name)
     }
+
+    /// Build `{"channel": <channel_name>, "instId": <inst_id>}` for a packable
+    /// kind. Whole-message + unsupported kinds return `Err` → per-spec fallback.
+    fn instid_value(spec: &StreamSpec) -> Result<Value, WebSocketError> {
+        // Special whole-message channels — no per-instId arg.
+        if matches!(
+            spec.kind,
+            StreamKind::Liquidation
+                | StreamKind::BlockTrade
+                | StreamKind::SettlementEvent
+                | StreamKind::OptionGreeks
+        ) {
+            return Err(WebSocketError::NotImplemented(
+                "okx: whole-message channel not packable — use per-spec frame".into(),
+            ));
+        }
+        let channel = Self::channel_name(&spec.kind).ok_or_else(|| {
+            WebSocketError::NotImplemented(format!("okx: unsupported stream kind {:?}", spec.kind))
+        })?;
+        // Match the standard subscribe_frame instId rewrite: futures-only kinds
+        // on FuturesCross get the "-SWAP" suffix.
+        let inst_id = if spec.account_type == AccountType::FuturesCross
+            && Self::is_futures_only_kind(&spec.kind)
+        {
+            Self::to_swap_instid(spec.symbol.as_str())
+        } else {
+            spec.symbol.as_str().to_string()
+        };
+        Ok(json!({ "channel": channel, "instId": inst_id }))
+    }
 }
 
 impl WsProtocol for OkxProtocol {
@@ -311,6 +342,21 @@ impl WsProtocol for OkxProtocol {
         };
 
         Ok(Self::build_instid_frame("unsubscribe", &channel, &inst_id))
+    }
+
+    /// OKX: args object array for standard instId-based channels. Whole-message
+    /// channels (liquidation-orders / public-block-trades / estimated-price /
+    /// opt-summary) have no per-instId arg — `topic_fn` returns `Err` for them
+    /// → per-spec fallback (Q13), preserving the existing special frame.
+    fn batch_grammar(&self, _account_type: AccountType) -> Option<&'static BatchGrammar> {
+        static OKX_BATCH: BatchGrammar = BatchGrammar {
+            topic_fn: OkxProtocol::instid_value,
+            envelope: envelope_args,
+            // OKX docs: a single subscribe message may carry ≤300 args.
+            chunk_cap: 300,
+            group_key: None,
+        };
+        Some(&OKX_BATCH)
     }
 
     fn auth_frame(&self, credentials: &Credentials) -> Option<Result<WsFrame, WebSocketError>> {

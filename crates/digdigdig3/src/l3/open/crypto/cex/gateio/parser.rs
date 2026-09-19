@@ -1428,9 +1428,9 @@ mod tests {
 
     #[test]
     fn test_parse_klines() {
-        // Gate.io format: [time, volume, close, high, low, open, quote_volume]
+        // Gate.io format: [time, quote_volume, close, high, low, open, base_volume, windowClosed]
         let response = json!([
-            ["1566703320", "123.456", "8553.74", "8550.24", "8527.17", "8533.02", "1000000.00"]
+            ["1566703320", "123.456", "8553.74", "8550.24", "8527.17", "8533.02", "1000000.00", "true"]
         ]);
 
         let klines = GateioParser::parse_klines(&response).unwrap();
@@ -1441,7 +1441,10 @@ mod tests {
         assert!((kline.close - 8553.74).abs() < f64::EPSILON);
         assert!((kline.high - 8550.24).abs() < f64::EPSILON);
         assert!((kline.low - 8527.17).abs() < f64::EPSILON);
-        assert!((kline.volume - 123.456).abs() < f64::EPSILON);
+        // idx1 = quote (USDT) volume, idx6 = base (BTC) volume.
+        assert!((kline.quote_volume.unwrap() - 123.456).abs() < f64::EPSILON);
+        assert!((kline.volume - 1000000.00).abs() < f64::EPSILON);
+        assert_eq!(kline.confirm, Some(true));
     }
 
     #[test]

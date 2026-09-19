@@ -22,9 +22,9 @@ use crate::core::rt::WsFrame;
 use crate::core::traits::Credentials;
 use crate::core::types::{AccountType, StreamEvent, WebSocketError, WebSocketResult};
 use crate::core::websocket::{
-    KlineInterval, StreamKind, StreamSpec,
+    BatchGrammar, KlineInterval, StreamKind, StreamSpec,
     TopicKey, TopicRegistry,
-    WsProtocol,
+    WsProtocol, envelope_gate,
 };
 use crate::core::timestamp_seconds;
 
@@ -124,6 +124,32 @@ impl GateIoProtocol {
         GateIoCategory::from_account_type(self.account_type)
     }
 
+    /// Gate.io payload element for batch. `topic_fn` returns the single
+    /// payload string for kinds whose payload is exactly one element —
+    /// otherwise `Err` → per-spec fallback (multi-element payloads like
+    /// candlesticks `[interval, sym]` / order_book `[sym, depth, speed]`
+    /// cannot be folded by the pump's one-element-per-spec model).
+    fn single_payload_value(spec: &StreamSpec) -> Result<Value, WebSocketError> {
+        let prefix = GateIoCategory::from_account_type(spec.account_type).channel_prefix();
+        let (_channel, payload) = channel_and_payload(prefix, spec)?;
+        if payload.len() == 1 {
+            Ok(Value::String(payload[0].clone()))
+        } else {
+            Err(WebSocketError::NotImplemented(
+                "gateio: multi-element payload not batchable — use per-spec frame".into(),
+            ))
+        }
+    }
+
+    /// Group key = the wire channel (`<prefix>.<suffix>`), so spec sharing a
+    /// frame must share the same channel (Gate.io: one channel per message).
+    fn gate_group_key(spec: &StreamSpec) -> String {
+        let prefix = GateIoCategory::from_account_type(spec.account_type).channel_prefix();
+        channel_and_payload(prefix, spec)
+            .map(|(ch, _)| ch)
+            .unwrap_or_default()
+    }
+
     /// Build subscribe/unsubscribe frame.
     fn build_frame(op: &str, spec: &StreamSpec) -> Result<WsFrame, WebSocketError> {
         let category = GateIoCategory::from_account_type(spec.account_type);
@@ -194,6 +220,21 @@ impl WsProtocol for GateIoProtocol {
 
     fn unsubscribe_frame(&self, spec: &StreamSpec) -> Result<WsFrame, WebSocketError> {
         Self::build_frame("unsubscribe", spec)
+    }
+
+    /// Gate.io: `payload` string array + per-kind `channel` (from `group_key`).
+    /// Only single-element payload kinds pack (`tickers`, `trades`,
+    /// `public_liquidates`); multi-element payloads (candlesticks,
+    /// order_book) → `Err` → per-spec fallback.
+    fn batch_grammar(&self, _account_type: AccountType) -> Option<&'static BatchGrammar> {
+        static GATE_BATCH: BatchGrammar = BatchGrammar {
+            topic_fn: GateIoProtocol::single_payload_value,
+            envelope: envelope_gate,
+            // Gate.io docs cap a single subscribe message's payload array.
+            chunk_cap: 200,
+            group_key: Some(GateIoProtocol::gate_group_key),
+        };
+        Some(&GATE_BATCH)
     }
 
     fn auth_frame(&self, _credentials: &Credentials) -> Option<Result<WsFrame, WebSocketError>> {

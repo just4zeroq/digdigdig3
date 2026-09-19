@@ -27,9 +27,9 @@ use crate::core::rt::WsFrame;
 use crate::core::traits::Credentials;
 use crate::core::types::{AccountType, StreamEvent, WebSocketError, WebSocketResult};
 use crate::core::websocket::{
-    KlineInterval, StreamKind, StreamSpec,
+    BatchGrammar, KlineInterval, StreamKind, StreamSpec,
     TopicKey, TopicRegistry,
-    WsProtocol,
+    WsProtocol, envelope_subscription,
 };
 use crate::core::utils::symbol_normalizer::SymbolNormalizer;
 use crate::core::types::ExchangeId;
@@ -71,6 +71,29 @@ impl MexcProtocol {
             account_type,
             AccountType::FuturesCross | AccountType::FuturesIsolated
         )
+    }
+
+    /// Build the spot channel-name string for a spec — same mapping as
+    /// `spot_subscribe_frame`'s params (limit-depth for Ticker/Orderbook,
+    /// aggre_deals for Trade, kline for Kline). Futures kinds are not packable
+    /// here → `Err` → per-spec fallback.
+    fn spot_channel_value(spec: &StreamSpec) -> Result<Value, WebSocketError> {
+        let sym = spec.symbol.as_str();
+        let channel = match &spec.kind {
+            StreamKind::Ticker => MexcWsChannels::limit_depth(sym, 5),
+            StreamKind::Trade | StreamKind::AggTrade => MexcWsChannels::aggre_deals(sym),
+            StreamKind::Orderbook | StreamKind::OrderbookDelta => MexcWsChannels::limit_depth(sym, 5),
+            StreamKind::Kline { interval } => {
+                MexcWsChannels::kline(sym, &mexc_spot_kline_interval(interval))
+            }
+            other => {
+                return Err(WebSocketError::NotImplemented(format!(
+                    "mexc spot: unsupported stream kind {:?}",
+                    other
+                )))
+            }
+        };
+        Ok(Value::String(channel))
     }
 
     /// Build SUBSCRIPTION frame for spot (params array).
@@ -239,6 +262,23 @@ impl WsProtocol for MexcProtocol {
         } else {
             Self::spot_subscribe_frame(spec, "unsubscribe")
         }
+    }
+
+    /// MEXC Spot only — params string array with `method: SUBSCRIPTION`.
+    /// Futures uses a single-object `param` (no array envelope) → `None`, so
+    /// futures stays on the per-spec loop.
+    fn batch_grammar(&self, account_type: AccountType) -> Option<&'static BatchGrammar> {
+        if Self::is_futures(account_type) {
+            return None;
+        }
+        static MEXC_SPOT_BATCH: BatchGrammar = BatchGrammar {
+            topic_fn: MexcProtocol::spot_channel_value,
+            envelope: envelope_subscription,
+            // Spot docs cap a single SUBSCRIPTION message's params array.
+            chunk_cap: 200,
+            group_key: None,
+        };
+        Some(&MEXC_SPOT_BATCH)
     }
 
     fn auth_frame(&self, _credentials: &Credentials) -> Option<Result<WsFrame, WebSocketError>> {

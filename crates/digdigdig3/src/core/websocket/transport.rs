@@ -1644,5 +1644,65 @@ mod tests {
         let cfg = ReconnectConfig::default();
         assert_eq!(cfg.lag_threshold, 512);
         assert_eq!(cfg.lag_check_interval_ms, 5_000);
+        assert!(cfg.subscribe_bucket.is_none(), "default = no pacing");
+    }
+
+    /// Driver batch accounting: `subscribe_batch` on a mock protocol routes
+    /// through `subscribe_batch_inner` — the same single path `subscribe`
+    /// (batch-of-one) uses — and returns a `WsBatchAck` whose `submitted`
+    /// lists every request. No connection needed: the cmd is queued, and
+    /// accounting happens synchronously at build time.
+    #[tokio::test]
+    async fn batch_subscribe_accounts_all() {
+        use crate::core::websocket::stream_spec::StreamSpec;
+
+        // Mock protocol: no grammar → build_looped (one frame per spec).
+        struct NoGrammarProtocol;
+        impl WsProtocol for NoGrammarProtocol {
+            fn name(&self) -> &'static str { "mock" }
+            fn endpoint(&self, _a: AccountType, _t: bool) -> url::Url {
+                url::Url::parse("wss://mock.invalid").unwrap()
+            }
+            fn ping_frame(&self) -> Option<WsFrame> { None }
+            fn auth_frame(&self, _c: &crate::core::traits::Credentials) -> Option<Result<WsFrame, WebSocketError>> { None }
+            fn subscribe_frame(&self, _s: &StreamSpec) -> Result<WsFrame, WebSocketError> {
+                Ok(WsFrame::Text("{}".into()))
+            }
+            fn unsubscribe_frame(&self, _s: &StreamSpec) -> Result<WsFrame, WebSocketError> {
+                Ok(WsFrame::Text("{}".into()))
+            }
+            fn extract_topic(&self, _raw: &Value) -> Option<crate::core::websocket::topic_registry::TopicKey> { None }
+            fn topic_registry(&self, _a: AccountType) -> &crate::core::websocket::topic_registry::TopicRegistry {
+                static REG: std::sync::OnceLock<crate::core::websocket::topic_registry::TopicRegistry> =
+                    std::sync::OnceLock::new();
+                REG.get_or_init(|| crate::core::websocket::topic_registry::TopicRegistryBuilder::default().build())
+            }
+        }
+
+        let transport = UniversalWsTransport::<NoGrammarProtocol>::new(
+            NoGrammarProtocol,
+            AccountType::Spot,
+            false,
+            None,
+        );
+
+        // Two ticker requests → batch-of-two via the loop path (no grammar).
+        let mk = |sym: &str| -> StreamSpec {
+            use crate::core::types::{StreamType, SubscriptionRequest, Symbol};
+            StreamSpec::try_from(SubscriptionRequest {
+                symbol: Symbol::with_raw("", "", sym.to_string()),
+                stream_type: StreamType::Ticker,
+                account_type: AccountType::Spot,
+                depth: None,
+                update_speed_ms: None,
+            })
+            .unwrap()
+        };
+        let ack = transport
+            .subscribe_batch(vec![mk("BTCUSDT"), mk("ETHUSDT")])
+            .await
+            .expect("batch subscribe");
+        assert_eq!(ack.submitted.len(), 2, "both should be submitted");
+        assert!(ack.dropped.is_empty());
     }
 }

@@ -26,9 +26,9 @@ use crate::core::rt::WsFrame;
 use crate::core::traits::Credentials;
 use crate::core::types::{AccountType, StreamEvent, WebSocketError, WebSocketResult};
 use crate::core::websocket::{
-    KlineInterval, StreamKind, StreamSpec,
+    BatchGrammar, KlineInterval, StreamKind, StreamSpec,
     TopicKey, TopicRegistry,
-    WsProtocol,
+    WsProtocol, envelope_args,
 };
 
 use super::parser::BybitParser;
@@ -142,6 +142,12 @@ impl BybitProtocol {
 
         Ok(topic)
     }
+
+    /// `build_topic` returns a `Result<String, _>`; the grammar wants a
+    /// `Result<Value, _>`.
+    fn build_topic_value(spec: &StreamSpec) -> Result<Value, WebSocketError> {
+        Ok(Value::String(Self::build_topic(spec)?))
+    }
 }
 
 impl WsProtocol for BybitProtocol {
@@ -212,6 +218,19 @@ impl WsProtocol for BybitProtocol {
 
     fn unsubscribe_frame(&self, spec: &StreamSpec) -> Result<WsFrame, WebSocketError> {
         Self::build_frame("unsubscribe", spec)
+    }
+
+    /// Bybit V5: args string array. `build_topic` errs on wire-absent intervals
+    /// / unsupported kinds → those fall back to per-spec (Q13).
+    fn batch_grammar(&self, _account_type: AccountType) -> Option<&'static BatchGrammar> {
+        static BYBIT_BATCH: BatchGrammar = BatchGrammar {
+            topic_fn: BybitProtocol::build_topic_value,
+            envelope: envelope_args,
+            // V5: a single subscribe message carries ≤200 args (docs).
+            chunk_cap: 200,
+            group_key: None,
+        };
+        Some(&BYBIT_BATCH)
     }
 
     fn auth_frame(&self, _credentials: &Credentials) -> Option<Result<WsFrame, WebSocketError>> {

@@ -15,9 +15,9 @@ use crate::core::rt::WsFrame;
 use crate::core::traits::Credentials;
 use crate::core::types::{AccountType, StreamEvent, WebSocketError, WebSocketResult};
 use crate::core::websocket::{
-    KlineInterval, StreamKind, StreamSpec,
+    BatchGrammar, KlineInterval, StreamKind, StreamSpec,
     TopicKey, TopicRegistry,
-    WsProtocol,
+    WsProtocol, envelope_args,
 };
 use super::parser::BitgetParser;
 
@@ -119,6 +119,33 @@ impl BitgetProtocol {
         Ok(WsFrame::Text(frame.to_string()))
     }
 
+    /// Build the `{"instType","channel","instId"}` args element for a packable
+    /// public kind. Unpackable kinds return `Err` → per-spec fallback.
+    fn arg_value(spec: &StreamSpec) -> Result<Value, WebSocketError> {
+        // Liquidation has no public V2 Classic channel.
+        if matches!(spec.kind, StreamKind::Liquidation) {
+            return Err(WebSocketError::WireAbsent(
+                "Bitget V2 Classic futures has no public liquidation WS channel".into(),
+            ));
+        }
+        // Private streams use a "default" instId and auth; not batchable with
+        // public data in one frame.
+        if spec.kind.is_private() {
+            return Err(WebSocketError::NotImplemented(
+                "bitget: private stream not batchable".into(),
+            ));
+        }
+        let channel = Self::channel_name(&spec.kind).ok_or_else(|| {
+            WebSocketError::NotImplemented(format!("bitget: unsupported stream kind {:?}", spec.kind))
+        })?;
+        let inst_type = Self::inst_type(spec.account_type);
+        Ok(json!({
+            "instType": inst_type,
+            "channel": channel,
+            "instId": spec.symbol.to_uppercase(),
+        }))
+    }
+
     /// Build the spot topic registry (cached).
     fn spot_registry() -> &'static TopicRegistry {
         SPOT_REGISTRY.get_or_init(|| build_registry(AccountType::Spot))
@@ -160,6 +187,21 @@ impl WsProtocol for BitgetProtocol {
 
     fn unsubscribe_frame(&self, spec: &StreamSpec) -> Result<WsFrame, WebSocketError> {
         Self::build_frame("unsubscribe", spec)
+    }
+
+    /// Bitget V2: args object array `{"instType","channel","instId"}`.
+    /// Liquidation (no public channel) and private kinds return `Err` → the
+    /// per-spec fallback preserves the existing WireAbsent / private frame.
+    fn batch_grammar(&self, account_type: AccountType) -> Option<&'static BatchGrammar> {
+        static BITGET_BATCH: BatchGrammar = BatchGrammar {
+            topic_fn: BitgetProtocol::arg_value,
+            envelope: envelope_args,
+            // V2 docs: a single subscribe message carries ≤200 args.
+            chunk_cap: 200,
+            group_key: None,
+        };
+        let _ = account_type;
+        Some(&BITGET_BATCH)
     }
 
     fn auth_frame(&self, _credentials: &Credentials) -> Option<Result<WsFrame, WebSocketError>> {

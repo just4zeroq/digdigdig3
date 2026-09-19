@@ -27,7 +27,8 @@ use crate::core::types::{
     OrderbookDelta as OrderbookDeltaData,
 };
 use crate::core::websocket::{
-    KlineInterval, StreamKind, StreamSpec, TopicKey, TopicRegistry, WsProtocol,
+    BatchGrammar, KlineInterval, StreamKind, StreamSpec, TopicKey, TopicRegistry, WsProtocol,
+    envelope_params_upper,
 };
 
 use super::endpoints::BinanceUrls;
@@ -167,6 +168,12 @@ impl BinanceProtocol {
         });
         Ok(WsFrame::Text(frame.to_string()))
     }
+
+    /// `stream_name` returns a `Result<String, _>`, the grammar wants a
+    /// `Result<Value, _>` — wraps the stream string into a JSON string element.
+    fn stream_name_value(spec: &StreamSpec) -> Result<Value, WebSocketError> {
+        Ok(Value::String(Self::stream_name(spec)?))
+    }
 }
 
 impl WsProtocol for BinanceProtocol {
@@ -198,6 +205,21 @@ impl WsProtocol for BinanceProtocol {
 
     fn unsubscribe_frame(&self, spec: &StreamSpec) -> Result<WsFrame, WebSocketError> {
         Self::build_sub_frame("UNSUBSCRIBE", spec)
+    }
+
+    /// Binance combined-stream: params string array, method uppercased.
+    /// `stream_name` errs on private kinds / OpenInterest → those fall back to
+    /// the per-spec path (Q13), preserving the existing error.
+    fn batch_grammar(&self, _account_type: AccountType) -> Option<&'static BatchGrammar> {
+        static BINANCE_BATCH: BatchGrammar = BatchGrammar {
+            topic_fn: BinanceProtocol::stream_name_value,
+            envelope: envelope_params_upper,
+            // Combined-stream endpoint errors when a single SUBSCRIBE message
+            // contains more than 200 streams.
+            chunk_cap: 200,
+            group_key: None,
+        };
+        Some(&BINANCE_BATCH)
     }
 
     fn auth_frame(&self, _credentials: &Credentials) -> Option<Result<WsFrame, WebSocketError>> {
@@ -1041,5 +1063,76 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert_eq!(v["params"][0], "btcusdt@kline_1h");
+    }
+
+    /// Batch subscribe for Binance: two ticker specs → ONE packed frame with
+    /// both `@ticker` streams, method uppercased (`SUBSCRIBE`), single path.
+    #[test]
+    fn test_batch_subscribe_packs_two_streams() {
+        let proto = BinanceProtocol::new(AccountType::Spot, false);
+        let mut a = spot_spec(StreamKind::Ticker);
+        a.symbol = crate::core::types::OwnedSymbolInput::Raw("BTCUSDT".into());
+        let mut b = spot_spec(StreamKind::Ticker);
+        b.symbol = crate::core::types::OwnedSymbolInput::Raw("ETHUSDT".into());
+
+        let build = proto
+            .subscribe_frame_batch(&[a, b])
+            .expect("batch build");
+
+        // Packed: one frame, both submitted.
+        assert_eq!(build.frames.len(), 1, "two specs should pack into one frame");
+        assert_eq!(build.submitted.len(), 2);
+        assert!(build.dropped.is_empty());
+
+        let text = match &build.frames[0] {
+            WsFrame::Text(t) => t.clone(),
+            _ => panic!("expected text"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(v["method"], "SUBSCRIBE", "Binance needs uppercase method");
+        assert_eq!(v["params"].as_array().unwrap().len(), 2);
+        assert_eq!(v["params"][0], "btcusdt@ticker");
+        assert_eq!(v["params"][1], "ethusdt@ticker");
+    }
+
+    /// 1000-symbol batch: chunked by `chunk_cap: 200` → 5 packed frames total
+    /// (vs 1000 one-per-spec frames), all submitted, none dropped. This is the
+    /// rate-limit raison d'être — Binance caps SUBSCRIBE messages/minute.
+    #[test]
+    fn test_batch_subscribe_packs_thousand_symbols_into_five_frames() {
+        let proto = BinanceProtocol::new(AccountType::Spot, false);
+
+        // 1000 ticker specs, one per symbol.
+        let specs: Vec<StreamSpec> = (0..1000)
+            .map(|i| {
+                let mut s = spot_spec(StreamKind::Ticker);
+                s.symbol =
+                    crate::core::types::OwnedSymbolInput::Raw(format!("XY{0:04}USDT", i));
+                s
+            })
+            .collect();
+
+        let build = proto
+            .subscribe_frame_batch(&specs)
+            .expect("batch build of 1000");
+
+        // 1000 / 200 cap = exactly 5 frames.
+        assert_eq!(build.frames.len(), 5, "1000 specs must pack into ceil(1000/200) frames");
+        assert_eq!(build.submitted.len(), 1000, "every spec submitted");
+        assert!(build.dropped.is_empty());
+
+        // Each frame carries its chunk of params, method uppercased.
+        for frame in &build.frames {
+            let WsFrame::Text(t) = frame else { panic!("expected text") };
+            let v: serde_json::Value = serde_json::from_str(t).expect("valid JSON");
+            assert_eq!(v["method"], "SUBSCRIBE");
+            assert_eq!(v["params"].as_array().unwrap().len(), 200);
+        }
+
+        // First frame prefix visible for sanity.
+        let WsFrame::Text(first) = &build.frames[0] else { unreachable!() };
+        let v: serde_json::Value = serde_json::from_str(first).unwrap();
+        assert_eq!(v["params"][0], "xy0000usdt@ticker");
+        assert_eq!(v["params"][199], "xy0199usdt@ticker");
     }
 }
