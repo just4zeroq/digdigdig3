@@ -22,6 +22,7 @@ use url::Url;
 
 use crate::core::rt::WsFrame;
 use crate::core::traits::Credentials;
+use crate::core::utils::now_ms;
 use crate::core::types::{
     AccountType, OrderBookLevel, StreamEvent, WebSocketError, WebSocketResult,
     OrderbookDelta as OrderbookDeltaData,
@@ -485,7 +486,13 @@ fn parse_book_ticker(raw: &Value) -> WebSocketResult<StreamEvent> {
 
     // @bookTicker short keys: u=updateId, s=symbol, b=bidPrice, B=bidQty,
     //   a=askPrice, A=askQty, T=transactionTime, E=eventTime.
-    // Live curl 2026-06-15: all verified present on both spot and futures.
+    //
+    // Wire reality (raw WS_TRACE capture 2026-09-19): the SPOT stream carries
+    // ONLY `u,s,b,B,a,A` — no `T`/`E`, so `timestamp` used to always be 0.
+    // USDⓈ-M futures send the `e`-enveloped form which DOES include T/E, so
+    // prefer `T` and fall back to the local receive clock on spot (same
+    // no-wire-timestamp convention already used for Bitfinex/GateIO/
+    // HyperLiquid/Upbit parsers).
     let bid = parse_f64("b");
     let ask = parse_f64("a");
     let last_price = bid.unwrap_or(0.0);
@@ -503,7 +510,10 @@ fn parse_book_ticker(raw: &Value) -> WebSocketResult<StreamEvent> {
             quote_volume_24h: None,
             price_change_24h: None,
             price_change_percent_24h: None,
-            timestamp: data.get("T").and_then(|t| t.as_i64()).unwrap_or(0),
+            timestamp: data
+                .get("T")
+                .and_then(|t| t.as_i64())
+                .unwrap_or_else(now_ms),
             bid_qty: parse_f64("B"),
             ask_qty: parse_f64("A"),
             update_id: data.get("u").and_then(|v| v.as_i64()),
@@ -996,6 +1006,34 @@ mod tests {
                 // `update_id` presence is the bookTicker-vs-24h-ticker
                 // discriminator the redis example keys separate streams on.
                 assert_eq!(ticker.update_id, Some(400900217));
+            }
+            other => panic!("expected Ticker, got {other:?}"),
+        }
+    }
+
+    /// Spot `@bookTicker` carries NO `T`/`E` on the live wire (raw capture
+    /// 2026-09-19: keys are exactly `u,s,b,B,a,A`). The parser must fall back
+    /// to the local receive clock — a 0 timestamp made the feed undatable.
+    #[test]
+    fn test_book_ticker_spot_without_t_falls_back_to_now() {
+        let before = now_ms();
+        let frame = serde_json::json!({
+            "u": 100341892006_i64,
+            "s": "BTCUSDT",
+            "b": "81280.04000000",
+            "B": "6.26531000",
+            "a": "81280.05000000",
+            "A": "1.70287000"
+        });
+        let ev = parse_book_ticker(&frame).expect("parse_book_ticker");
+        match ev {
+            StreamEvent::Ticker { ticker, .. } => {
+                assert!(
+                    ticker.timestamp >= before && ticker.timestamp <= now_ms(),
+                    "timestamp {} must be the local receive clock",
+                    ticker.timestamp
+                );
+                assert_eq!(ticker.update_id, Some(100341892006));
             }
             other => panic!("expected Ticker, got {other:?}"),
         }
