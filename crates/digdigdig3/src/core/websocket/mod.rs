@@ -17,6 +17,7 @@
 // base_websocket.rs is kept on disk but not compiled — Wave 2 will remove it.
 // mod base_websocket;
 
+pub mod batch;
 pub mod capability_provider;
 pub mod protocol;
 pub mod reconnect;
@@ -27,6 +28,10 @@ pub use digdigdig3_core::core::websocket::{stream_kind, stream_spec, support_lev
 pub mod topic_registry;
 pub mod transport;
 
+pub use batch::{
+    BatchBuild, BatchGrammar, EnvelopeFn, envelope_args, envelope_gate, envelope_params_upper,
+    envelope_subscription,
+};
 pub use capability_provider::CapabilityProvider;
 pub use protocol::WsProtocol;
 pub use reconnect::ReconnectConfig;

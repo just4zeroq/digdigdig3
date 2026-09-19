@@ -26,6 +26,21 @@ pub struct ReconnectConfig {
     /// How often (ms) the lag-check task polls `event_tx.len()`.
     /// Default 5000 (5 s).
     pub lag_check_interval_ms: u64,
+    /// Optional outbound frame pacing for subscribe/unsubscribe/replay.
+    ///
+    /// `Some((max_frames, window))` limits how many subscription frames are
+    /// placed on the wire per `window` (a token bucket), so a batch of 1000
+    /// symbols never blasts the venue's per-window message cap (Binance caps
+    /// `SUBSCRIBE` messages ~5/10s on the combined-stream endpoint).
+    ///
+    /// `None` (default) = no pacing — required by the "do not change
+    /// existing behavior" constraint. Pacing only ever delays *subscription*
+    /// frames; data frames, pings, and the read loop are never blocked by it.
+    ///
+    /// Note: when set, `UniversalWsTransport::connect()` returns once the
+    /// connection+auth is up; replay of active subscriptions then drains
+    /// through this bucket in the background.
+    pub subscribe_bucket: Option<(u32, Duration)>,
 }
 
 impl Default for ReconnectConfig {
@@ -41,6 +56,7 @@ impl Default for ReconnectConfig {
             silent_multiplier: 2,
             lag_threshold: 512,
             lag_check_interval_ms: 5_000,
+            subscribe_bucket: None,
         }
     }
 }

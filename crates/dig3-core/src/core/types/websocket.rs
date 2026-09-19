@@ -18,7 +18,7 @@ use super::{
     LongShortRatio, MarginType, MarketWarning, MarkPrice, OpenInterest, OptionGreeks, OrderBook,
     OrderSide, OrderbookL3Event, OrderStatus, OrderType, OrderbookDelta as OrderbookDeltaData, PositionSide,
     PredictedFunding, Price, PublicTrade, Quantity, RiskLimit, SettlementEvent, Symbol, Ticker,
-    Timestamp, VolatilityIndex,
+    Timestamp, VolatilityIndex, WebSocketError,
 };
 use crate::core::websocket::stream_kind::KlineInterval;
 
@@ -214,8 +214,29 @@ impl SubscriptionRequest {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// STREAM EVENTS
+// SUBSCRIPTION BATCH RESULT
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/// Result of a batch subscribe/unsubscribe call.
+///
+/// Split into the requests that were accepted (frame built, queued for wire
+/// send) and those that failed *frame construction* — e.g. a `WireAbsent`
+/// kind on a venue (`Binance WS has no realtime open interest`), a delisted
+/// symbol that the protocol rejects at build time, or an unsupported
+/// `StreamKind`. Errors that only surface at **ack time** (the exchange
+/// replies with an error for an individual channel) are NOT reported here —
+/// they arrive asynchronously via `StreamEvent::SubscriptionFailed` on the
+/// event stream.
+#[derive(Debug, Clone)]
+pub struct WsBatchAck {
+    /// Requests whose frames were built successfully and queued for send.
+    /// These are entered into the transport's active-subscription set and
+    /// will be replayed on reconnect.
+    pub submitted: Vec<SubscriptionRequest>,
+    /// Requests that failed during frame construction, with the reason.
+    /// These were never queued and never entered the active set.
+    pub dropped: Vec<(SubscriptionRequest, WebSocketError)>,
+}
 
 /// События от WebSocket потока
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,6 +373,33 @@ pub enum StreamEvent {
     /// Nesting (`Batch` inside `Batch`) is supported by the flattener but
     /// should be avoided.
     Batch(Vec<StreamEvent>),
+
+    /// A subscription failed asynchronously — after the subscribe call
+    /// returned Ok.
+    ///
+    /// Frame-construction failures are reported synchronously in
+    /// [`WsBatchAck::dropped`] instead. This variant covers errors that only
+    /// surface at ack time (or on a later reconnect replay): the exchange
+    /// answered a batch subscribe with a per-channel error, a replayed
+    /// subscription was rejected after reconnection, transport-level
+    /// connection errors kill a batch before its frames were delivered, etc.
+    /// The transport pushes this onto the event stream so consumers that
+    /// need `(symbol, kind)`-level failure observability have a channel —
+    /// without changing the synchronous shape of `subscribe` /
+    /// `subscribe_batch`.
+    ///
+    /// Note: full per-symbol ack correlation is a separate, later feature.
+    /// Today the transport emits this for connect/system-level failures and
+    /// for single-subscribe frame-build errors (those also return `Err`
+    /// synchronously; this is an additional async notification).
+    SubscriptionFailed {
+        /// The spec that failed. This is a lossy projection back to the
+        /// public boundary — `StreamKind` → `StreamType`, raw symbol → the
+        /// `Symbol::with_raw("", "", s)` form — matching how
+        /// `StreamSpec::from(SubscriptionRequest)` / back works.
+        request: SubscriptionRequest,
+        error: WebSocketError,
+    },
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

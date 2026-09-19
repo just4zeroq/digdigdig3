@@ -45,11 +45,12 @@ use gloo_timers::future::sleep as gloo_sleep;
 use crate::core::rt::{self, WsFrame, WsRtError};
 use crate::core::traits::Credentials;
 use crate::core::types::{
-    AccountType, ConnectionStatus, StreamEvent, SubscriptionRequest, WebSocketError,
+    AccountType, ConnectionStatus, StreamEvent, SubscriptionRequest, WsBatchAck, WebSocketError,
     WebSocketResult,
 };
 
 use super::{
+    batch::BatchBuild,
     capability_provider::CapabilityProvider,
     protocol::WsProtocol,
     reconnect::{BackoffState, ReconnectConfig},
@@ -84,6 +85,81 @@ impl TransportState {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SubscribeBudget — outbound pacing for subscribe/unsubscribe/replay frames
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Token-bucket pace for subscription frames (Q9).
+///
+/// `ReconnectConfig::subscribe_bucket: Some((max_frames, window))` permits
+/// `max_frames` subscription frames per `window`, then stalls further frames
+/// until tokens refill. `None` (the default) forwards immediately — no pacing,
+/// byte-for-byte legacy timing.
+///
+/// Pure sync + deterministic: `try_take` advances refills from a wall-clock
+/// anchor and returns the wait needed (or `None` if a token was granted), so
+/// the caller can sleep without holding a lock. Data frames, pings, pong
+/// replies, and the read loop are never gated by this.
+struct SubscribeBudget {
+    /// Whether pacing is enabled. `false` = `try_take` always grants.
+    paced: bool,
+    /// Tokens currently available (fractional).
+    tokens: f64,
+    /// Max tokens (=== `max_frames`).
+    capacity: f64,
+    /// Tokens refilled per second = capacity / window_secs.
+    refill_per_sec: f64,
+    /// Wall-clock anchor of the last refill.
+    last_refill: Instant,
+}
+
+impl SubscribeBudget {
+    fn new(cfg: Option<(u32, Duration)>) -> Self {
+        match cfg {
+            Some((max_frames, window)) => {
+                let secs = window.as_secs_f64().max(0.001);
+                Self {
+                    paced: true,
+                    tokens: max_frames as f64,
+                    capacity: max_frames as f64,
+                    refill_per_sec: max_frames as f64 / secs,
+                    last_refill: Instant::now(),
+                }
+            }
+            None => Self {
+                paced: false,
+                tokens: f64::INFINITY,
+                capacity: f64::INFINITY,
+                refill_per_sec: f64::INFINITY,
+                last_refill: Instant::now(),
+            },
+        }
+    }
+
+    /// Try to take one token.
+    ///
+    /// - `Ok(())` — a token was granted (or pacing is off); send now.
+    /// - `Err(dur)` — the bucket is empty; wait `dur` then retry.
+    fn try_take(&mut self) -> Result<(), Duration> {
+        if !self.paced {
+            return Ok(());
+        }
+        // Refill since last_take.
+        let elapsed = self.last_refill.elapsed().as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        self.last_refill = Instant::now();
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            Ok(())
+        } else {
+            // Time to refill one token.
+            let deficit = 1.0 - self.tokens;
+            let wait_secs = (deficit / self.refill_per_sec).max(0.001);
+            Err(Duration::from_secs_f64(wait_secs))
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // TransportCmd
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -95,8 +171,16 @@ pub(super) enum TransportCmd {
     /// symbol, which used to leak a malformed subscribe frame to exchanges
     /// whose `subscribe_frame` accepts an empty symbol (dYdX, Bitfinex).
     Connect,
-    Subscribe(StreamSpec),
-    Unsubscribe(StreamSpec),
+    /// Batch subscribe — several specs folded into packed frame(s) by the
+    /// caller before queueing (frame-build failures were already reported via
+    /// `WsBatchAck::dropped`). The driver merges `build.submitted` into
+    /// `active_subs` and queues `build.frames` for the outbound scheduler.
+    ///
+    /// The single `subscribe(spec)` path uses this same command (batch of
+    /// one) — Q11-A keeps a single code path.
+    SubscribeBatch { build: BatchBuild },
+    /// Batch unsubscribe — symmetric to `SubscribeBatch`.
+    UnsubscribeBatch { build: BatchBuild },
     Shutdown,
 }
 
@@ -190,6 +274,7 @@ impl<P: WsProtocol> UniversalWsTransport<P> {
             http: reqwest::Client::new(),
             last_frame_at,
             rt: rt::default_runtime(),
+            out_tx: None,
         };
 
         // Spawn driver via cfg-conditional rt dispatch.
@@ -285,26 +370,134 @@ impl<P: WsProtocol> UniversalWsTransport<P> {
 
     /// Subscribe to a stream.
     ///
-    /// Eagerly probes `subscribe_frame` BEFORE queuing the subscribe command.
+    /// Eagerly probes the frame builder BEFORE queuing the subscribe command.
     /// Any frame-construction error (`WireAbsent`, `NotImplemented`,
     /// or any other variant the protocol returns) is propagated to the caller
     /// immediately. Callers see the failure right away instead of
     /// `silent_0_events` after a heal cycle timeout (this was the root cause
     /// of MLI's OOM on 53-stream validator — see release-0.3.7-plan).
+    ///
+    /// Q11-A: the single call is a batch of one — same frame-build /
+    /// queue / accounting / replay path as `subscribe_batch`.
     pub async fn subscribe(&self, spec: StreamSpec) -> WebSocketResult<()> {
-        if let Err(e) = self.protocol.subscribe_frame(&spec) {
-            return Err(e);
+        let ack = self.subscribe_batch_inner(vec![spec.clone()]).await?;
+        if !ack.submitted.is_empty() {
+            return Ok(());
         }
-        self.cmd_tx
-            .send(TransportCmd::Subscribe(spec))
-            .map_err(|_| WebSocketError::ProtocolError("transport shut down".into()))
+        // Exactly one spec -> dropped is non-empty iff it failed build.
+        let (_, err) = ack
+            .dropped
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("empty batch submit with no dropped — protocol bug"));
+        // Q14 hook: besides the sync Err, also surface it asynchronously so
+        // consumers monitoring the event stream observe the failure too.
+        let _ = self
+            .event_tx
+            .send(Ok(StreamEvent::SubscriptionFailed {
+                request: SubscriptionRequest::from(spec),
+                error: err.clone(),
+            }));
+        Err(err)
     }
 
-    /// Unsubscribe from a stream.
+    /// Unsubscribe from a stream. Batch-of-one via `unsubscribe_batch`.
     pub async fn unsubscribe(&self, spec: StreamSpec) -> WebSocketResult<()> {
+        let ack = self.unsubscribe_batch_inner(vec![spec.clone()]).await?;
+        if !ack.submitted.is_empty() {
+            return Ok(());
+        }
+        let (_, err) = ack
+            .dropped
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("empty batch submit with no dropped — protocol bug"));
+        Err(err)
+    }
+
+    /// Batch subscribe — fold N `StreamSpec`s into packed frame(s) using the
+    /// venue's `batch_grammar` (or the per-spec loop when the venue has no
+    /// packed form), queue the frames for the outbound scheduler, and report
+    /// per-spec frame-build failures synchronously in `WsBatchAck::dropped`.
+    ///
+    /// "Submitted" means frames were built and queued — NOT that the
+    /// exchange acked them. Ack-level / connect-level failures that only
+    /// surface asynchronously are pushed to the event stream as
+    /// [`StreamEvent::SubscriptionFailed`] (driver-side; ack correlation is
+    /// a later, separate feature).
+    pub async fn subscribe_batch(&self, specs: Vec<StreamSpec>) -> WebSocketResult<WsBatchAck> {
+        self.subscribe_batch_inner(specs).await
+    }
+
+    /// Symmetric batch unsubscribe.
+    pub async fn unsubscribe_batch(&self, specs: Vec<StreamSpec>) -> WebSocketResult<WsBatchAck> {
+        self.unsubscribe_batch_inner(specs).await
+    }
+
+    /// Shared implementation of batch subscribe. Builds the frames
+    /// (uniformly via `protocol.subscribe_frame_batch` — packing or loop)
+    /// and queues `TransportCmd::SubscribeBatch` carrying the prebuilt
+    /// frames, so the driver does not rebuild them (Q11-A: the build result
+    /// travels inside the command; `submitted` = already entered into
+    /// `active_subs` accounting by the driver).
+    async fn subscribe_batch_inner(
+        &self,
+        specs: Vec<StreamSpec>,
+    ) -> WebSocketResult<WsBatchAck> {
+        if specs.is_empty() {
+            return Ok(WsBatchAck {
+                submitted: Vec::new(),
+                dropped: Vec::new(),
+            });
+        }
+        let build = self.protocol.subscribe_frame_batch(&specs)?;
+        let dropped: Vec<(SubscriptionRequest, WebSocketError)> = build
+            .dropped
+            .iter()
+            .cloned()
+            .map(|(spec, e)| (SubscriptionRequest::from(spec), e))
+            .collect();
+        let submitted: Vec<SubscriptionRequest> = build
+            .submitted
+            .iter()
+            .cloned()
+            .map(SubscriptionRequest::from)
+            .collect();
         self.cmd_tx
-            .send(TransportCmd::Unsubscribe(spec))
-            .map_err(|_| WebSocketError::ProtocolError("transport shut down".into()))
+            .send(TransportCmd::SubscribeBatch { build })
+            .map_err(|_| WebSocketError::ProtocolError("transport shut down".into()))?;
+        Ok(WsBatchAck { submitted, dropped })
+    }
+
+    /// Shared implementation of batch unsubscribe. Symmetric to
+    /// [`Self::subscribe_batch_inner`].
+    async fn unsubscribe_batch_inner(
+        &self,
+        specs: Vec<StreamSpec>,
+    ) -> WebSocketResult<WsBatchAck> {
+        if specs.is_empty() {
+            return Ok(WsBatchAck {
+                submitted: Vec::new(),
+                dropped: Vec::new(),
+            });
+        }
+        let build = self.protocol.unsubscribe_frame_batch(&specs)?;
+        let dropped: Vec<(SubscriptionRequest, WebSocketError)> = build
+            .dropped
+            .iter()
+            .cloned()
+            .map(|(spec, e)| (SubscriptionRequest::from(spec), e))
+            .collect();
+        let submitted: Vec<SubscriptionRequest> = build
+            .submitted
+            .iter()
+            .cloned()
+            .map(SubscriptionRequest::from)
+            .collect();
+        self.cmd_tx
+            .send(TransportCmd::UnsubscribeBatch { build })
+            .map_err(|_| WebSocketError::ProtocolError("transport shut down".into()))?;
+        Ok(WsBatchAck { submitted, dropped })
     }
 
     /// Returns a broadcast receiver stream.
@@ -411,6 +604,32 @@ impl<P: WsProtocol> crate::core::traits::WebSocketConnector for UniversalWsTrans
         UniversalWsTransport::unsubscribe(self, spec).await
     }
 
+    /// Override the trait default loop with the packed batch path (Q12).
+    async fn subscribe_batch(
+        &self,
+        requests: Vec<SubscriptionRequest>,
+    ) -> WebSocketResult<WsBatchAck> {
+        // Reuse the same single-path-as-batch-of-one machinery; convert the
+        // public requests to internal StreamSpecs first.
+        let specs: Vec<StreamSpec> = requests
+            .into_iter()
+            .map(StreamSpec::try_from)
+            .collect::<WebSocketResult<Vec<_>>>()?;
+        UniversalWsTransport::subscribe_batch(self, specs).await
+    }
+
+    /// Override the trait default loop with the packed batch path (Q12).
+    async fn unsubscribe_batch(
+        &self,
+        requests: Vec<SubscriptionRequest>,
+    ) -> WebSocketResult<WsBatchAck> {
+        let specs: Vec<StreamSpec> = requests
+            .into_iter()
+            .map(StreamSpec::try_from)
+            .collect::<WebSocketResult<Vec<_>>>()?;
+        UniversalWsTransport::unsubscribe_batch(self, specs).await
+    }
+
     fn event_stream(&self) -> Pin<Box<dyn Stream<Item = WebSocketResult<StreamEvent>> + Send>> {
         Box::pin(UniversalWsTransport::event_stream(self))
     }
@@ -442,6 +661,10 @@ struct DriverTask<P: WsProtocol> {
     last_frame_at: Arc<TokioMutex<Instant>>,
     /// Runtime abstraction: spawn + sleep + connect_ws.
     rt: rt::Runtime,
+    /// Outbound scheduler sender — created per-connection (see `run`). The
+    /// message loop feeds subscription frames here (paced by `SubscribeBudget`);
+    /// pings/pong replies bypass it and go straight to `write_tx`.
+    out_tx: Option<mpsc::UnboundedSender<WsFrame>>,
 }
 
 impl<P: WsProtocol> DriverTask<P> {
@@ -551,38 +774,6 @@ impl<P: WsProtocol> DriverTask<P> {
                 }
             }
 
-            // ── Subscription replay ────────────────────────────────────────
-            {
-                let subs = self.active_subs.read().await;
-                for spec in subs.iter() {
-                    match self.protocol.subscribe_frame(spec) {
-                        Ok(frame) => {
-                            if let Err(e) = conn.send(frame).await {
-                                warn!(target: "dig3::ws::replay", exchange, error = %e, "replay send failed");
-                            }
-                        }
-                        Err(e) => {
-                            warn!(target: "dig3::ws::replay", exchange, error = %e, "subscribe_frame failed");
-                        }
-                    }
-                }
-            }
-
-            // ── Post-connect frames (e.g. Coinbase heartbeats channel) ────────
-            for frame in self.protocol.post_connect_frames() {
-                if let Err(e) = conn.send(frame).await {
-                    warn!(target: "dig3::ws::connect", exchange, error = %e, "post_connect frame send failed");
-                }
-            }
-
-            // ── Mark Connected ─────────────────────────────────────────────
-            self.state
-                .store(TransportState::Connected as u8, Ordering::Release);
-            backoff.reset();
-            // Reset silence clock so we measure from connection time, not task start.
-            *self.last_frame_at.lock().await = Instant::now();
-            debug!(target: "dig3::ws::connect", exchange, "connected");
-
             // ── Channel-bridge for read / write separation ─────────────────
             // `WsConn` is a single `&mut` object. To use it safely in a
             // `tokio::select!` loop where both the read arm (next_frame) and
@@ -591,9 +782,10 @@ impl<P: WsProtocol> DriverTask<P> {
             //
             //   read_task:  conn.next_frame() → read_tx
             //   write_task: write_rx → conn.send()
+            //   scheduler_task: out_rx (subscriptions, paced) → write_tx
             //
             // The main select! loop owns only the channel endpoints —
-            // no `&mut conn` in the loop.  Both bridge tasks are stopped via
+            // no `&mut conn` in the loop.  All bridge tasks are stopped via
             // a oneshot `kill` signal when the loop exits.
 
             // Channel carries Option<Result<..>>: Some(frame) = data, None = EOF.
@@ -618,6 +810,129 @@ impl<P: WsProtocol> DriverTask<P> {
             let conn_shared = Arc::new(TokioMutex::new(conn));
             let conn_read = Arc::clone(&conn_shared);
             let conn_write = Arc::clone(&conn_shared);
+
+            // write task (consumes write_rx)
+            {
+                let mut write_rx = write_rx;
+                let mut kill_sub = kill_tx.subscribe();
+                let write_fut = async move {
+                    loop {
+                        tokio::select! {
+                            frame = write_rx.recv() => {
+                                match frame {
+                                    Some(f) => {
+                                        let _ = conn_write.lock().await.send(f).await;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            _ = kill_sub.recv() => break,
+                        }
+                    }
+                };
+                #[cfg(not(target_arch = "wasm32"))]
+                tokio::spawn(write_fut);
+                #[cfg(target_arch = "wasm32")]
+                wasm_bindgen_futures::spawn_local(write_fut);
+            }
+
+            // ── Outbound scheduler (paced subscription frames) ─────────────
+            // Subscription / unsubscribe / replay frames flow through here so
+            // a burst of hundreds of frames obeys the venue's subscribe-message
+            // window (`subscribe_bucket`). Pings + pong replies bypass it and
+            // go straight to `write_tx` — never paced. `None` bucket = forward
+            // immediately (byte-for-byte legacy timing).
+            {
+                let (sched_tx, sched_rx) = mpsc::unbounded_channel::<WsFrame>();
+                self.out_tx = Some(sched_tx);
+                let mut sched_rx = sched_rx;
+                let mut kill_sub = kill_tx.subscribe();
+                let write_tx = write_tx.clone();
+                let mut budget = SubscribeBudget::new(self.reconnect_cfg.subscribe_bucket);
+                let last_frame_at = Arc::clone(&self.last_frame_at);
+                let sched_fut = async move {
+                    loop {
+                        tokio::select! {
+                            frame = sched_rx.recv() => {
+                                match frame {
+                                    Some(f) => {
+                                        // Gate on the token bucket (paced only).
+                                        // Ok = token acquired; Err(dur) = wait dur.
+                                        loop {
+                                            match budget.try_take() {
+                                                Ok(()) => break,
+                                                Err(d) => {
+                                                    #[cfg(not(target_arch = "wasm32"))]
+                                                    tokio::time::sleep(d).await;
+                                                    #[cfg(target_arch = "wasm32")]
+                                                    gloo_sleep(d).await;
+                                                }
+                                            }
+                                        }
+                                        if write_tx.send(f).is_err() {
+                                            break;
+                                        }
+                                        // A placed subscribe frame is evidence of
+                                        // life — feed the silent-stream watchdog
+                                        // (Q8). Pings are NOT counted.
+                                        *last_frame_at.lock().await = Instant::now();
+                                    }
+                                    None => break,
+                                }
+                            }
+                            _ = kill_sub.recv() => break,
+                        }
+                    }
+                };
+                #[cfg(not(target_arch = "wasm32"))]
+                tokio::spawn(sched_fut);
+                #[cfg(target_arch = "wasm32")]
+                wasm_bindgen_futures::spawn_local(sched_fut);
+            }
+
+            // ── Subscription replay ────────────────────────────────────────
+            // Rebuild via the SAME batch builder the live path uses, so a large
+            // active set replays as packed + paced frames, and feed the scheduler
+            // (never `conn` directly). Frame-build failures are warned (they
+            // would only occur if a kind was removed from the protocol after
+            // subscribe). Mark Connected happens AFTER this, but the scheduler
+            // drains in the background (Q8) — replay does not block connect().
+            {
+                let subs: Vec<StreamSpec> = self.active_subs.read().await.iter().cloned().collect();
+                if !subs.is_empty() {
+                    match self.protocol.subscribe_frame_batch(&subs) {
+                        Ok(build) => {
+                            if let Some(out) = &self.out_tx {
+                                for frame in build.frames {
+                                    if out.send(frame).is_err() {
+                                        warn!(target: "dig3::ws::replay", exchange, "replay send: scheduler gone");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(target: "dig3::ws::replay", exchange, error = %e, "replay frame build failed");
+                        }
+                    }
+                }
+            }
+
+            // ── Post-connect frames (e.g. Coinbase heartbeats channel) ────────
+            // Not subscriptions — send directly (unpaced).
+            for frame in self.protocol.post_connect_frames() {
+                if write_tx.send(frame).is_err() {
+                    warn!(target: "dig3::ws::connect", exchange, "post_connect frame send failed");
+                }
+            }
+
+            // ── Mark Connected ─────────────────────────────────────────────
+            self.state
+                .store(TransportState::Connected as u8, Ordering::Release);
+            backoff.reset();
+            // Reset silence clock so we measure from connection time, not task start.
+            *self.last_frame_at.lock().await = Instant::now();
+            debug!(target: "dig3::ws::connect", exchange, "connected");
 
             // read task
             {
@@ -686,31 +1001,6 @@ impl<P: WsProtocol> DriverTask<P> {
                 tokio::spawn(read_fut);
                 #[cfg(target_arch = "wasm32")]
                 wasm_bindgen_futures::spawn_local(read_fut);
-            }
-
-            // write task
-            {
-                let mut write_rx = write_rx;
-                let mut kill_sub = kill_tx.subscribe();
-                let write_fut = async move {
-                    loop {
-                        tokio::select! {
-                            frame = write_rx.recv() => {
-                                match frame {
-                                    Some(f) => {
-                                        let _ = conn_write.lock().await.send(f).await;
-                                    }
-                                    None => break,
-                                }
-                            }
-                            _ = kill_sub.recv() => break,
-                        }
-                    }
-                };
-                #[cfg(not(target_arch = "wasm32"))]
-                tokio::spawn(write_fut);
-                #[cfg(target_arch = "wasm32")]
-                wasm_bindgen_futures::spawn_local(write_fut);
             }
 
             // ── Silent-stream watchdog ─────────────────────────────────────
@@ -834,31 +1124,44 @@ impl<P: WsProtocol> DriverTask<P> {
                             // Pure connect trigger — connection is already up by
                             // the time we reach the message loop. No-op.
                             Some(TransportCmd::Connect) => {}
-                            Some(TransportCmd::Subscribe(spec)) => {
-                                // Add to active set first
-                                self.active_subs.write().await.insert(spec.clone());
-                                match self.protocol.subscribe_frame(&spec) {
-                                    Ok(frame) => {
-                                        if write_tx.send(frame).is_err() {
-                                            warn!(target: "dig3::ws", exchange, "subscribe send: write task gone");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(target: "dig3::ws", exchange, error = %e, "subscribe_frame failed");
+                            Some(TransportCmd::SubscribeBatch { build }) => {
+                                // The batch was already frame-built by the caller
+                                // (`subscribe_batch_inner`), so `build.submitted` are
+                                // the specs whose frames were built. Enter them all in
+                                // `active_subs` first, then queue every frame for the
+                                // outbound scheduler (paced, Q9). Frames are pushed in
+                                // order; the scheduler forwards them to the write task.
+                                {
+                                    let mut active = self.active_subs.write().await;
+                                    for spec in &build.submitted {
+                                        active.insert(spec.clone());
                                     }
                                 }
-                            }
-                            Some(TransportCmd::Unsubscribe(spec)) => {
-                                self.active_subs.write().await.remove(&spec);
-                                match self.protocol.unsubscribe_frame(&spec) {
-                                    Ok(frame) => {
-                                        if write_tx.send(frame).is_err() {
-                                            warn!(target: "dig3::ws", exchange, "unsubscribe send: write task gone");
+                                if let Some(out) = &self.out_tx {
+                                    for frame in build.frames {
+                                        if out.send(frame).is_err() {
+                                            warn!(target: "dig3::ws", exchange, "subscribe send: scheduler gone");
                                         }
                                     }
-                                    Err(e) => {
-                                        warn!(target: "dig3::ws", exchange, error = %e, "unsubscribe_frame failed");
+                                } else {
+                                    warn!(target: "dig3::ws", exchange, "subscribe send: no outbound scheduler");
+                                }
+                            }
+                            Some(TransportCmd::UnsubscribeBatch { build }) => {
+                                {
+                                    let mut active = self.active_subs.write().await;
+                                    for spec in &build.submitted {
+                                        active.remove(spec);
                                     }
+                                }
+                                if let Some(out) = &self.out_tx {
+                                    for frame in build.frames {
+                                        if out.send(frame).is_err() {
+                                            warn!(target: "dig3::ws", exchange, "unsubscribe send: scheduler gone");
+                                        }
+                                    }
+                                } else {
+                                    warn!(target: "dig3::ws", exchange, "unsubscribe send: no outbound scheduler");
                                 }
                             }
                             Some(TransportCmd::Shutdown) => {
@@ -1312,6 +1615,26 @@ mod tests {
             queue_depth > lag_threshold,
             "expected queue_depth {queue_depth} > lag_threshold {lag_threshold}"
         );
+    }
+
+    /// `SubscribeBudget` pacing math: a windowed bucket grants `max_frames` tokens,
+    /// then forwards a wait duration for the next (Q9).
+    #[test]
+    fn subscribe_budget_gates_after_capacity() {
+        let mut b = SubscribeBudget::new(Some((2, Duration::from_secs(1))));
+        // Two tokens available immediately.
+        assert!(b.try_take().is_ok());
+        assert!(b.try_take().is_ok());
+        // Third take must wait (bucket empty) — returns a wait duration.
+        assert!(b.try_take().is_err());
+    }
+
+    #[test]
+    fn subscribe_budget_unpaced_always_grants() {
+        let mut b = SubscribeBudget::new(None);
+        for _ in 0..1000 {
+            assert!(b.try_take().is_ok());
+        }
     }
 
     /// ReconnectConfig default lag fields are sane.

@@ -458,7 +458,7 @@ impl From<crate::core::utils::symbol_normalizer::NormalizerError> for ExchangeEr
 pub type ExchangeResult<T> = Result<T, ExchangeError>;
 
 /// Ошибки WebSocket
-#[derive(Debug, Clone, Error)]
+#[derive(Debug, Clone, Error, Serialize, Deserialize)]
 pub enum WebSocketError {
     #[error("Connection error: {0}")]
     ConnectionError(String),

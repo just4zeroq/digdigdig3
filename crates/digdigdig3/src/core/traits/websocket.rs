@@ -16,7 +16,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::core::types::{
     AccountType, ConnectionStatus, OrderbookCapabilities, StreamEvent, StreamType,
-    SubscriptionRequest, Symbol, WebSocketResult,
+    SubscriptionRequest, Symbol, WebSocketResult, WsBatchAck,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -71,6 +71,44 @@ pub trait WebSocketConnector: Send + Sync {
         Err(crate::core::types::WebSocketError::NotImplemented(
             "WebSocket not supported".into(),
         ))
+    }
+
+    /// Batch subscribe — several requests at once.
+    ///
+    /// Default implementation (Q12): loop `subscribe` per request and aggregate
+    /// the per-request outcome into a [`WsBatchAck`]. Implementations backed by
+    /// `UniversalWsTransport` override this with the packed batch path
+    /// (`subscribe_frame_batch`), which folds many specs into a handful of wire
+    /// frames (Q3). `submitted` = requests whose frames were built AND queued;
+    /// `dropped` = those that failed frame construction at the caller level
+    /// (individual request errors are not mapped back to a specific request by
+    /// the default loop — each maps to a dropped entry with its error).
+    async fn subscribe_batch(&self, requests: Vec<SubscriptionRequest>) -> WebSocketResult<WsBatchAck> {
+        let mut submitted = Vec::with_capacity(requests.len());
+        let mut dropped = Vec::new();
+        for req in requests {
+            let outcome = self.subscribe(req.clone()).await;
+            match outcome {
+                Ok(()) => submitted.push(req),
+                Err(e) => dropped.push((req, e)),
+            }
+        }
+        Ok(WsBatchAck { submitted, dropped })
+    }
+
+    /// Batch unsubscribe — several requests at once. Symmetric to
+    /// [`Self::subscribe_batch`].
+    async fn unsubscribe_batch(&self, requests: Vec<SubscriptionRequest>) -> WebSocketResult<WsBatchAck> {
+        let mut submitted = Vec::with_capacity(requests.len());
+        let mut dropped = Vec::new();
+        for req in requests {
+            let outcome = self.unsubscribe(req.clone()).await;
+            match outcome {
+                Ok(()) => submitted.push(req),
+                Err(e) => dropped.push((req, e)),
+            }
+        }
+        Ok(WsBatchAck { submitted, dropped })
     }
 
     /// Получить поток событий

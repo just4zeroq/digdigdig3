@@ -13,6 +13,7 @@ use crate::core::traits::Credentials;
 use crate::core::types::{AccountType, WebSocketError};
 
 use super::{
+    batch::{BatchBuild, BatchGrammar},
     stream_kind::StreamKind,
     stream_spec::StreamSpec,
     topic_registry::{TopicKey, TopicRegistry},
@@ -72,6 +73,61 @@ pub trait WsProtocol: Send + Sync + 'static {
     /// Build the unsubscribe frame for one StreamSpec.
     /// Returns Err if the stream kind is not supported.
     fn unsubscribe_frame(&self, spec: &StreamSpec) -> Result<WsFrame, WebSocketError>;
+
+    // ── Batch subscription frames ─────────────────────────────────────────
+
+    /// The venue's packed-batch grammar, if it has one.
+    ///
+    /// Return `Some` only when the venue's subscribe frame is an array
+    /// envelope that can carry multiple specs in a single message (`params`
+    /// for Binance, `args` for Bybit/OKX/Bitget/MEXC/Gate). The transport
+    /// uses this to fold many specs into one (or several, when `chunk_cap`
+    /// is exceeded) wire frames. Default `None` = no packed form → the
+    /// per-spec loop (legacy behavior, unchanged).
+    ///
+    /// Implementations typically return a `&'static` table entry:
+    ///
+    /// ```
+    /// fn batch_grammar(&self, _a: AccountType) -> Option<&'static BatchGrammar> {
+    ///     Some(&BINANCE_BATCH)
+    /// }
+    /// ```
+    fn batch_grammar(&self, _account_type: AccountType) -> Option<&'static BatchGrammar> {
+        None
+    }
+
+    /// Build the wire frames (and submitted/dropped split) for a batch
+    /// subscribe. Uses [`Self::batch_grammar`] when present, else loops
+    /// per-spec through [`Self::subscribe_frame`].
+    ///
+    /// Never fails for an empty input. Fails only when every spec failed
+    /// frame construction — but that is reported via `BatchBuild::dropped`
+    /// rather than `Err` for partial batches (Q3/B). `Err` is reserved for
+    /// protocol-level rejections of the whole message (no grammar, a
+    /// spec list the protocol refuses to batch).
+    fn subscribe_frame_batch(
+        &self,
+        specs: &[StreamSpec],
+    ) -> Result<BatchBuild, WebSocketError> {
+        let account_type = specs.get(0).map(|s| s.account_type).unwrap_or_default();
+        match self.batch_grammar(account_type) {
+            Some(g) => crate::core::websocket::batch::build_packed(self, g, "subscribe", true, specs),
+            None => crate::core::websocket::batch::build_looped(self, specs, true),
+        }
+    }
+
+    /// Symmetric unsubscribe batch builder. Default = loop per-spec through
+    /// [`Self::unsubscribe_frame`].
+    fn unsubscribe_frame_batch(
+        &self,
+        specs: &[StreamSpec],
+    ) -> Result<BatchBuild, WebSocketError> {
+        let account_type = specs.get(0).map(|s| s.account_type).unwrap_or_default();
+        match self.batch_grammar(account_type) {
+            Some(g) => crate::core::websocket::batch::build_packed(self, g, "unsubscribe", false, specs),
+            None => crate::core::websocket::batch::build_looped(self, specs, false),
+        }
+    }
 
     // ── Auth ──────────────────────────────────────────────────────────────
 
