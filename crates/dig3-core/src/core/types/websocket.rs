@@ -52,6 +52,8 @@ pub enum StreamType {
 
     /// Тикер
     Ticker,
+    /// Best bid/offer (top-of-book) ticker
+    BookTicker,
     /// Сделки
     Trade,
     /// Снепшот стакана
@@ -192,6 +194,10 @@ impl SubscriptionRequest {
 
     pub fn agg_trade(symbol: Symbol) -> Self {
         Self::new(symbol, StreamType::AggTrade)
+    }
+
+    pub fn book_ticker(symbol: Symbol) -> Self {
+        Self::new(symbol, StreamType::BookTicker)
     }
 
     pub fn trade_for(symbol: Symbol, account_type: AccountType) -> Self {

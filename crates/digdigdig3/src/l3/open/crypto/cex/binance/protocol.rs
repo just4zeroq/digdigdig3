@@ -80,6 +80,7 @@ impl BinanceProtocol {
 
         let name = match &spec.kind {
             StreamKind::Ticker => format!("{}@ticker", symbol),
+            StreamKind::BookTicker => format!("{}@bookTicker", symbol),
             StreamKind::Trade => format!("{}@trade", symbol),
             StreamKind::AggTrade => format!("{}@aggTrade", symbol),
 
@@ -326,7 +327,8 @@ fn build_registry(account_type: AccountType) -> TopicRegistry {
         .register(StreamKind::Orderbook, account_type, "partialDepth", parse_partial_depth_raw)
         // miniTicker / bookTicker
         .register(StreamKind::Ticker, account_type, "*@miniTicker", parse_mini_ticker)
-        .register(StreamKind::Ticker, account_type, "*@bookTicker", parse_book_ticker);
+        .register(StreamKind::Ticker, account_type, "*@bookTicker", parse_book_ticker)
+        .register(StreamKind::BookTicker, account_type, "*@bookTicker", parse_book_ticker);
 
     // ── Kline streams (all intervals, same parser) ────────────────────────
     for (wire, internal) in BINANCE_KLINE_INTERVALS {
@@ -960,6 +962,61 @@ mod tests {
             depth: None,
             speed_ms: None,
         }
+    }
+
+    fn close(a: Option<f64>, b: f64) -> bool {
+        a.map(|v| (v - b).abs() < 1e-9).unwrap_or(false)
+    }
+
+    /// `@bookTicker` is a *new subscribable* stream kind — but the wire frame is
+    /// the same one that `StreamKind::Ticker` has passively decoded all along,
+    /// so the parser is reused. Assert the top-of-book shape end-to-end.
+    #[test]
+    fn test_book_ticker_parses_best_bid_offer() {
+        let frame = serde_json::json!({
+            "u": 400900217_i64,
+            "s": "BTCUSDT",
+            "b": "62500.10000000",
+            "B": "31.21000000",
+            "a": "62500.20000000",
+            "A": "40.66000000",
+            "T": 1_700_000_000_000_i64,
+            "E": 1_700_000_000_100_i64
+        });
+        let ev = parse_book_ticker(&frame).expect("parse_book_ticker");
+        match ev {
+            StreamEvent::Ticker { symbol, ticker } => {
+                assert_eq!(symbol, "BTCUSDT");
+                assert!(close(ticker.bid_price, 62500.10), "bid={:?}", ticker.bid_price);
+                assert!(close(ticker.ask_price, 62500.20), "ask={:?}", ticker.ask_price);
+                assert!(close(ticker.bid_qty, 31.21), "bid_qty={:?}", ticker.bid_qty);
+                assert!(close(ticker.ask_qty, 40.66), "ask_qty={:?}", ticker.ask_qty);
+                assert!(close(Some(ticker.last_price), 62500.10));
+                assert_eq!(ticker.timestamp, 1_700_000_000_000);
+                // `update_id` presence is the bookTicker-vs-24h-ticker
+                // discriminator the redis example keys separate streams on.
+                assert_eq!(ticker.update_id, Some(400900217));
+            }
+            other => panic!("expected Ticker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_book_ticker_subscribe_frame_and_registry() {
+        let proto = BinanceProtocol::new(AccountType::Spot, false);
+        let reg = proto.topic_registry(AccountType::Spot);
+        assert!(reg.supports(&StreamKind::BookTicker, AccountType::Spot));
+
+        let msg = proto
+            .subscribe_frame(&spot_spec(StreamKind::BookTicker))
+            .expect("subscribe_frame");
+        let WsFrame::Text(text) = msg else {
+            panic!("expected text frame")
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(v["method"], "SUBSCRIBE");
+        // Same wire stream the Ticker kind decodes — lowercase symbol + @bookTicker.
+        assert_eq!(v["params"][0], "btcusdt@bookTicker");
     }
 
     #[test]

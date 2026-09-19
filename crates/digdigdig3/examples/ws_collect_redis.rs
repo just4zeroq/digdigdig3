@@ -51,9 +51,9 @@ const SYMBOLS: &[&str] = &[
     "LINKUSDT", "POLUSDT",
 ];
 
-/// Four stream kinds per symbol → 40 subscription requests per exchange.
+/// Five stream kinds per symbol → 50 subscription requests per exchange.
 fn build_requests(exchange: ExchangeId) -> Vec<SubscriptionRequest> {
-    let mut reqs = Vec::with_capacity(SYMBOLS.len() * 4);
+    let mut reqs = Vec::with_capacity(SYMBOLS.len() * 5);
     for sym in SYMBOLS {
         let native = match exchange {
             ExchangeId::OKX => okx_native(sym),
@@ -61,6 +61,7 @@ fn build_requests(exchange: ExchangeId) -> Vec<SubscriptionRequest> {
         };
         let symbol = Symbol::with_raw("", "", native);
         reqs.push(SubscriptionRequest::ticker(symbol.clone()));
+        reqs.push(SubscriptionRequest::book_ticker(symbol.clone()));
         reqs.push(SubscriptionRequest::agg_trade(symbol.clone()));
         reqs.push(SubscriptionRequest::orderbook(symbol.clone()));
         reqs.push(SubscriptionRequest::kline(symbol, "1m"));
@@ -81,10 +82,20 @@ fn event_to_redis<'a>(
 ) -> Option<(String, String)> {
     use digdigdig3::core::types::StreamEvent::*;
     match event {
-        Ticker { symbol, ticker } => Some((
-            format!("dig3:{exchange}:ticker:{symbol}"),
-            serde_json::to_string(&ticker).ok()?,
-        )),
+        Ticker { symbol, ticker } => {
+            // BookTicker feeds (Binance @bookTicker / OKX bbo-tbt / Bitget books1)
+            // also arrive as StreamEvent::Ticker — the parser stamps `update_id`
+            // so we can tell them apart from the 24h ticker stream.
+            let stream = if ticker.update_id.is_some() {
+                "bookTicker"
+            } else {
+                "ticker"
+            };
+            Some((
+                format!("dig3:{exchange}:{stream}:{symbol}"),
+                serde_json::to_string(&ticker).ok()?,
+            ))
+        }
         AggTrade { symbol, agg } => Some((
             format!("dig3:{exchange}:aggTrade:{symbol}"),
             serde_json::to_string(&agg).ok()?,

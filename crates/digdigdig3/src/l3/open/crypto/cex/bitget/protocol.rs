@@ -13,7 +13,7 @@ use url::Url;
 
 use crate::core::rt::WsFrame;
 use crate::core::traits::Credentials;
-use crate::core::types::{AccountType, StreamEvent, WebSocketError, WebSocketResult};
+use crate::core::types::{AccountType, StreamEvent, Ticker, WebSocketError, WebSocketResult};
 use crate::core::websocket::{
     BatchGrammar, KlineInterval, StreamKind, StreamSpec,
     TopicKey, TopicRegistry,
@@ -65,6 +65,7 @@ impl BitgetProtocol {
     fn channel_name(kind: &StreamKind) -> Option<String> {
         let name = match kind {
             StreamKind::Ticker => "ticker".to_string(),
+            StreamKind::BookTicker => "books1".to_string(),
             StreamKind::Trade | StreamKind::AggTrade => "trade".to_string(),
             StreamKind::Orderbook => "books".to_string(),
             StreamKind::OrderbookDelta => "books15".to_string(),
@@ -279,6 +280,7 @@ fn build_registry(account_type: AccountType) -> TopicRegistry {
         .register(StreamKind::Orderbook, account_type, "books", parse_orderbook)
         .register(StreamKind::OrderbookDelta, account_type, "books5", parse_orderbook)
         .register(StreamKind::OrderbookDelta, account_type, "books15", parse_orderbook)
+        .register(StreamKind::BookTicker, account_type, "books1", parse_books1_ticker)
         .register(StreamKind::OrderUpdate, account_type, "orders", parse_order_update)
         .register(StreamKind::BalanceUpdate, account_type, "account", parse_balance_update)
         .register(StreamKind::PositionUpdate, account_type, "positions", parse_position_update);
@@ -421,6 +423,47 @@ fn parse_orderbook(raw: &Value) -> WebSocketResult<StreamEvent> {
         *sym = symbol;
     }
     Ok(event)
+}
+
+/// Parse `books1` (best level, 1-level snapshot per push) as a top-of-book `Ticker`.
+///
+/// Same envelope as other booksN channels — payload has bids/asks arrays of one
+/// level each and no instId (symbol comes from frame `arg.instId`).
+fn parse_books1_ticker(raw: &Value) -> WebSocketResult<StreamEvent> {
+    let data = frame_data(raw)?;
+    let symbol = raw
+        .get("arg")
+        .and_then(|a| a.get("instId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let event = BitgetParser::parse_ws_orderbook_delta(data)
+        .map_err(|e| WebSocketError::Parse(e.to_string()))?;
+    let book = match event {
+        StreamEvent::OrderbookSnapshot { book, .. } => book,
+        other => {
+            return Err(WebSocketError::Parse(format!(
+                "books1 expected OrderbookSnapshot, got {:?}",
+                std::mem::discriminant(&other)
+            )))
+        }
+    };
+    let bid = book.bids.first();
+    let ask = book.asks.first();
+    let timestamp = book.timestamp;
+    Ok(StreamEvent::Ticker {
+        symbol,
+        ticker: Ticker {
+            last_price: bid.map(|l| l.price).unwrap_or(0.0),
+            bid_price: bid.map(|l| l.price),
+            ask_price: ask.map(|l| l.price),
+            bid_qty: bid.map(|l| l.size),
+            ask_qty: ask.map(|l| l.size),
+            timestamp,
+            update_id: Some(timestamp),
+            ..Default::default()
+        },
+    })
 }
 
 fn parse_kline(raw: &Value) -> WebSocketResult<StreamEvent> {
@@ -893,6 +936,58 @@ mod tests {
             depth: None,
             speed_ms: None,
         }
+    }
+
+    fn close(a: Option<f64>, b: f64) -> bool {
+        a.map(|v| (v - b).abs() < 1e-9).unwrap_or(false)
+    }
+
+    /// Bitget `books1` — best level only. The data element carries NO `instId`
+    /// (symbol lives in the frame's `arg.instId`), which is exactly the trap
+    /// that made the full-depth `booksN` path emit an empty symbol.
+    #[test]
+    fn test_books1_ticker_parses_best_bid_offer() {
+        let frame = serde_json::json!({
+            "action": "snapshot",
+            "arg": { "instType": "SPOT", "channel": "books1", "instId": "BTCUSDT" },
+            "data": [{
+                "asks": [["62500.2", "0.5"]],
+                "bids": [["62500.1", "1.2"]],
+                "ts": "1700000000000",
+                "checksum": 123456
+            }]
+        });
+        let ev = parse_books1_ticker(&frame).expect("parse_books1_ticker");
+        match ev {
+            StreamEvent::Ticker { symbol, ticker } => {
+                assert_eq!(symbol, "BTCUSDT", "symbol must come from arg.instId");
+                assert!(close(ticker.bid_price, 62500.1), "bid={:?}", ticker.bid_price);
+                assert!(close(ticker.ask_price, 62500.2), "ask={:?}", ticker.ask_price);
+                assert!(close(ticker.bid_qty, 1.2), "bid_qty={:?}", ticker.bid_qty);
+                assert!(close(ticker.ask_qty, 0.5), "ask_qty={:?}", ticker.ask_qty);
+                assert_eq!(ticker.timestamp, 1_700_000_000_000);
+                assert_eq!(ticker.update_id, Some(1_700_000_000_000));
+            }
+            other => panic!("expected Ticker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_books1_ticker_subscribe_frame_and_registry() {
+        let proto = BitgetProtocol::new(AccountType::Spot, false);
+        let reg = proto.topic_registry(AccountType::Spot);
+        assert!(reg.supports(&StreamKind::BookTicker, AccountType::Spot));
+
+        let msg = proto
+            .subscribe_frame(&spot_spec(StreamKind::BookTicker))
+            .expect("subscribe_frame");
+        let WsFrame::Text(text) = msg else {
+            panic!("expected text frame")
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(v["op"], "subscribe");
+        assert_eq!(v["args"][0]["channel"], "books1");
+        assert_eq!(v["args"][0]["instId"], "BTCUSDT");
     }
 
     #[test]

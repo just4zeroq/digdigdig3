@@ -98,6 +98,7 @@ impl TryFrom<StreamType> for StreamKind {
     fn try_from(st: StreamType) -> WebSocketResult<Self> {
         Ok(match st {
             StreamType::Ticker => StreamKind::Ticker,
+            StreamType::BookTicker => StreamKind::BookTicker,
             StreamType::Trade => StreamKind::Trade,
             StreamType::Orderbook => StreamKind::Orderbook,
             StreamType::OrderbookDelta => StreamKind::OrderbookDelta,
@@ -149,6 +150,7 @@ impl From<StreamKind> for StreamType {
     fn from(kind: StreamKind) -> Self {
         match kind {
             StreamKind::Ticker => StreamType::Ticker,
+            StreamKind::BookTicker => StreamType::BookTicker,
             StreamKind::Trade => StreamType::Trade,
             StreamKind::Orderbook => StreamType::Orderbook,
             StreamKind::OrderbookDelta => StreamType::OrderbookDelta,

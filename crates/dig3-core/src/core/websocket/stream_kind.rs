@@ -42,6 +42,8 @@ pub enum StreamKind {
     CompositeIndex,
 
     // ── OrderBook ────────────────────────────────────────────────────────────
+    /// Best bid/offer (top-of-book) ticker — fastest way to see the spread
+    BookTicker,
     /// Level-2 full-depth snapshot
     Orderbook,
     /// Level-2 incremental delta stream

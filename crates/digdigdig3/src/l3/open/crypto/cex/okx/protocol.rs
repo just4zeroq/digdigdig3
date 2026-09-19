@@ -20,6 +20,7 @@ use crate::core::websocket::{
 use crate::core::{encode_base64, hmac_sha256, timestamp_iso8601};
 use crate::core::types::OrderbookDelta as OrderbookDeltaType;
 use crate::core::types::OrderBook;
+use crate::core::types::Ticker;
 
 use super::parser::OkxParser;
 
@@ -143,6 +144,7 @@ impl OkxProtocol {
     fn channel_name(kind: &StreamKind) -> Option<String> {
         let name = match kind {
             StreamKind::Ticker => "tickers".to_string(),
+            StreamKind::BookTicker => "bbo-tbt".to_string(),
             StreamKind::Trade => "trades".to_string(),
             // OKX has no separate aggTrade channel — maps to "trades"
             StreamKind::AggTrade => "trades".to_string(),
@@ -457,6 +459,7 @@ fn build_spot_registry() -> TopicRegistry {
         .register(StreamKind::Orderbook, at, "books", parse_books)
         .register(StreamKind::Orderbook, at, "books5", parse_books)
         .register(StreamKind::Orderbook, at, "bbo-tbt", parse_books)
+        .register(StreamKind::BookTicker, at, "bbo-tbt", parse_bbo_ticker)
         .register(StreamKind::OrderbookDelta, at, "books-l2-tbt", parse_books)
         .register(StreamKind::OrderbookDelta, at, "books50-l2-tbt", parse_books)
         .register(StreamKind::IndexPrice, at, "index-tickers", parse_index_tickers)
@@ -520,6 +523,7 @@ fn build_futures_registry() -> TopicRegistry {
         .register(StreamKind::Orderbook, at, "books", parse_books)
         .register(StreamKind::Orderbook, at, "books5", parse_books)
         .register(StreamKind::Orderbook, at, "bbo-tbt", parse_books)
+        .register(StreamKind::BookTicker, at, "bbo-tbt", parse_bbo_ticker)
         .register(StreamKind::OrderbookDelta, at, "books-l2-tbt", parse_books)
         .register(StreamKind::OrderbookDelta, at, "books50-l2-tbt", parse_books)
         // Futures-only channels.
@@ -770,6 +774,35 @@ fn parse_books(raw: &Value) -> WebSocketResult<StreamEvent> {
         };
         Ok(StreamEvent::OrderbookDelta { symbol, delta })
     }
+}
+
+/// Parse `bbo-tbt` (top-of-book, tick-by-tick) frame as a top-of-book `Ticker`.
+///
+/// OKX bbo-tbt data element shape (same envelope as books*):
+///   {"asks":[["px","sz",...]],"bids":[["px","sz",...]],"ts":"<ms>"}
+/// Each side carries exactly one best level → `Ticker { bid_price, ask_price,
+/// bid_qty, ask_qty }`. The `seqId`-less frame still timestamps `ts`.
+fn parse_bbo_ticker(raw: &Value) -> WebSocketResult<StreamEvent> {
+    let data = first_data_item(raw)?;
+    let (asks, bids) = OkxParser::parse_ws_orderbook(data)
+        .map_err(|e| WebSocketError::Parse(e.to_string()))?;
+    let ask = asks.first();
+    let bid = bids.first();
+    let timestamp = OkxParser::get_i64(data, "ts").unwrap_or(0);
+    let symbol = arg_inst_id(raw).to_string();
+    Ok(StreamEvent::Ticker {
+        symbol,
+        ticker: Ticker {
+            last_price: bid.map(|l| l.price).unwrap_or(0.0),
+            bid_price: bid.map(|l| l.price),
+            ask_price: ask.map(|l| l.price),
+            bid_qty: bid.map(|l| l.size),
+            ask_qty: ask.map(|l| l.size),
+            timestamp,
+            update_id: Some(timestamp),
+            ..Default::default()
+        },
+    })
 }
 
 fn parse_kline(raw: &Value) -> WebSocketResult<StreamEvent> {
@@ -1207,6 +1240,60 @@ mod tests {
             depth: None,
             speed_ms: None,
         }
+    }
+
+    fn close(a: Option<f64>, b: f64) -> bool {
+        a.map(|v| (v - b).abs() < 1e-9).unwrap_or(false)
+    }
+
+    /// OKX `bbo-tbt` (best bid/offer, tick-by-tick) — one level per side, no
+    /// `action` field, symbol only in the frame's `arg.instId`.
+    #[test]
+    fn test_bbo_ticker_parses_best_bid_offer() {
+        let frame = serde_json::json!({
+            "arg": { "channel": "bbo-tbt", "instId": "BTC-USDT" },
+            "data": [{
+                "asks": [["62500.2", "0.5", "0", "2"]],
+                "bids": [["62500.1", "1.2", "0", "3"]],
+                "ts": "1700000000000"
+            }]
+        });
+        let ev = parse_bbo_ticker(&frame).expect("parse_bbo_ticker");
+        match ev {
+            StreamEvent::Ticker { symbol, ticker } => {
+                assert_eq!(symbol, "BTC-USDT");
+                assert!(close(ticker.bid_price, 62500.1), "bid={:?}", ticker.bid_price);
+                assert!(close(ticker.ask_price, 62500.2), "ask={:?}", ticker.ask_price);
+                assert!(close(ticker.bid_qty, 1.2), "bid_qty={:?}", ticker.bid_qty);
+                assert!(close(ticker.ask_qty, 0.5), "ask_qty={:?}", ticker.ask_qty);
+                assert_eq!(ticker.timestamp, 1_700_000_000_000);
+                // bbo-tbt carries no book-sequence marker; the ms timestamp is
+                // the best available discriminator vs the 24h ticker stream.
+                assert_eq!(ticker.update_id, Some(1_700_000_000_000));
+            }
+            other => panic!("expected Ticker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bbo_ticker_subscribe_frame_and_registry() {
+        for at in [AccountType::Spot, AccountType::FuturesCross] {
+            let proto = OkxProtocol::new(at, false);
+            let reg = proto.topic_registry(at);
+            assert!(reg.supports(&StreamKind::BookTicker, at), "registry at {at:?}");
+        }
+
+        let proto = OkxProtocol::new(AccountType::Spot, false);
+        let msg = proto
+            .subscribe_frame(&spot_spec(StreamKind::BookTicker))
+            .expect("subscribe_frame");
+        let WsFrame::Text(text) = msg else {
+            panic!("expected text frame")
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(v["op"], "subscribe");
+        assert_eq!(v["args"][0]["channel"], "bbo-tbt");
+        assert_eq!(v["args"][0]["instId"], "BTC-USDT");
     }
 
     #[test]
