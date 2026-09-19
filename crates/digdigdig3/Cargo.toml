@@ -228,3 +228,6 @@ tokio-test = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
+
+[dev-dependencies]
+redis = { version = "1.7.0", default-features = false, features = ["tokio-comp"] }
