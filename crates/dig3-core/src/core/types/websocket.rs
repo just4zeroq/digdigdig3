@@ -190,6 +190,10 @@ impl SubscriptionRequest {
         Self::new(symbol, StreamType::Trade)
     }
 
+    pub fn agg_trade(symbol: Symbol) -> Self {
+        Self::new(symbol, StreamType::AggTrade)
+    }
+
     pub fn trade_for(symbol: Symbol, account_type: AccountType) -> Self {
         Self { symbol, stream_type: StreamType::Trade, account_type, depth: None, update_speed_ms: None }
     }

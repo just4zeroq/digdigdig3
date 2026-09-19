@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use digdigdig3::connector_manager::ExchangeHub;
 use digdigdig3::core::types::StreamEvent;
-use digdigdig3::core::types::{AccountType, ExchangeId, StreamType, SubscriptionRequest, Symbol};
+use digdigdig3::core::types::{AccountType, ExchangeId, SubscriptionRequest, Symbol};
 use futures_util::StreamExt;
 
 /// 10 symbols per exchange; the per-venue native format is derived in
@@ -61,7 +61,7 @@ fn build_requests(exchange: ExchangeId) -> Vec<SubscriptionRequest> {
         };
         let symbol = Symbol::with_raw("", "", native);
         reqs.push(SubscriptionRequest::ticker(symbol.clone()));
-        reqs.push(SubscriptionRequest::new(symbol.clone(), StreamType::AggTrade));
+        reqs.push(SubscriptionRequest::agg_trade(symbol.clone()));
         reqs.push(SubscriptionRequest::orderbook(symbol.clone()));
         reqs.push(SubscriptionRequest::kline(symbol, "1m"));
     }
