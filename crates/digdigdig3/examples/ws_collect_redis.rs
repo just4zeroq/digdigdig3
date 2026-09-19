@@ -48,7 +48,7 @@ use futures_util::StreamExt;
 /// [`build_requests`] (OKX uses `BTC-USDT`, Binance/Bitget use `BTCUSDT`).
 const SYMBOLS: &[&str] = &[
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT",
-    "LINKUSDT", "MATICUSDT",
+    "LINKUSDT", "POLUSDT",
 ];
 
 /// Four stream kinds per symbol → 40 subscription requests per exchange.
@@ -92,6 +92,13 @@ fn event_to_redis<'a>(
         OrderbookSnapshot { symbol, book } => Some((
             format!("dig3:{exchange}:orderbook:{symbol}"),
             serde_json::to_string(&book).ok()?,
+        )),
+        // OKX books5 pushes only book *deltas* (no `action` field → no snapshot
+        // frames) — record them under their own key so the data isn't lost.
+        // A consumer rebuilds the L2 book by applying deltas to a cached side.
+        OrderbookDelta { symbol, delta } => Some((
+            format!("dig3:{exchange}:orderbookDelta:{symbol}"),
+            serde_json::to_string(&delta).ok()?,
         )),
         Kline { symbol, interval, kline } => {
             let stream = format!("kline{}", interval.as_str().to_lowercase());
