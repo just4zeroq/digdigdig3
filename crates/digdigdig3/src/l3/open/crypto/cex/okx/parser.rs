@@ -31,7 +31,6 @@ use crate::core::types::{
     AccountType,
     Liquidation,
     OpenInterest, LongShortRatio, MarkPrice, AggTrade,
-    CurrencyInfo,
 };
 use crate::core::types::AlgoOrderResponse;
 use crate::core::types::{
@@ -308,67 +307,6 @@ impl OkxParser {
         }
 
         Ok(symbols)
-    }
-
-    /// Парсить справочник валют (`GET /api/v5/asset/currencies`).
-    ///
-    /// OKX по строке на связку `(ccy, chain)` — здесь они **агрегируются по
-    /// валюте**: одна запись на `ccy`, `networks` собирает и дедуплицирует цепочки.
-    /// Пустой `networks` — легальное состояние (биржа не отдала цепочки), не ошибка.
-    ///
-    /// Aggregated by currency: OKX emits one row per `(ccy, chain)`, this folds
-    /// them into one `CurrencyInfo` per `ccy` with deduplicated `networks`.
-    /// `extra` keeps the **first** row verbatim (raw passthrough convention —
-    /// `SymbolInfo::extra` does the same).
-    pub fn parse_currencies(response: &Value) -> ExchangeResult<Vec<CurrencyInfo>> {
-        let data = Self::extract_data(response)?;
-        let arr = data
-            .as_array()
-            .ok_or_else(|| ExchangeError::Parse("'data' is not an array".to_string()))?;
-
-        let mut map: std::collections::BTreeMap<String, CurrencyInfo> =
-            std::collections::BTreeMap::new();
-
-        for item in arr {
-            let Some(ccy) = Self::get_str(item, "ccy").filter(|s| !s.is_empty()) else {
-                continue;
-            };
-
-            let entry = map
-                .entry(ccy.to_string())
-                .or_insert_with(|| CurrencyInfo::new(ccy));
-
-            // имя: первое непустое значение выигрывает
-            if entry.name.is_none() {
-                entry.name = Self::get_str(item, "name")
-                    .map(str::to_string)
-                    .filter(|s| !s.is_empty());
-            }
-
-            // сети: `chain` может быть одним именем или списком через запятую
-            if let Some(chain) = Self::get_str(item, "chain") {
-                for c in chain.split(',') {
-                    let c = c.trim();
-                    if !c.is_empty() && !entry.networks.iter().any(|n| n == c) {
-                        entry.networks.push(c.to_string());
-                    }
-                }
-            }
-
-            if entry.deposit_enabled.is_none() {
-                entry.deposit_enabled = item.get("depositEnable").and_then(Value::as_bool);
-            }
-            if entry.withdraw_enabled.is_none() {
-                entry.withdraw_enabled = item.get("withdrawEnable").and_then(Value::as_bool);
-            }
-
-            // RAW: первая строка по валюте, как её вернула биржа
-            if entry.extra.is_null() {
-                entry.extra = item.clone();
-            }
-        }
-
-        Ok(map.into_values().collect())
     }
 
     /// Парсить funding rate
@@ -1929,55 +1867,6 @@ mod tests {
             assert!(message.contains("50111"));
             assert!(message.contains("Invalid sign"));
         }
-    }
-
-    /// `GET /api/v5/asset/currencies`：OKX 一行一个 `(ccy, chain)`，
-    /// 必须**按币种聚合**且链去重 —— 否则同币种会重复出现多次。
-    #[test]
-    fn test_parse_currencies_aggregates_by_ccy() {
-        let response = json!({
-            "code": "0",
-            "msg": "",
-            "data": [
-                {"ccy": "USDT", "name": "Tether", "chain": "Trc20",
-                 "depositEnable": true, "withdrawEnable": false},
-                {"ccy": "USDT", "name": "Tether", "chain": "Trc20",
-                 "depositEnable": true, "withdrawEnable": false},
-                {"ccy": "USDT", "name": "", "chain": "Erc20",
-                 "depositEnable": true, "withdrawEnable": false},
-                {"ccy": "BTC", "name": "Bitcoin"},
-                {"name": "no-currency-row"}
-            ]
-        });
-
-        let out = OkxParser::parse_currencies(&response).expect("parse");
-        assert_eq!(out.len(), 2, "按 ccy 去重，缺 ccy 的行被跳过");
-
-        let usdt = out.iter().find(|c| c.currency == "USDT").expect("USDT");
-        assert_eq!(
-            usdt.networks,
-            vec!["Trc20".to_string(), "Erc20".to_string()],
-            "Trc20 重复两次 + Erc20 → 去重后保序"
-        );
-        assert_eq!(usdt.name.as_deref(), Some("Tether"), "name 取首个非空");
-        assert_eq!(usdt.deposit_enabled, Some(true));
-        assert_eq!(usdt.withdraw_enabled, Some(false));
-        // RAW：首行原样透传（与 SymbolInfo.extra 同一惯例）
-        assert_eq!(usdt.extra["chain"], "Trc20");
-        assert_eq!(usdt.extra["ccy"], "USDT");
-
-        let btc = out.iter().find(|c| c.currency == "BTC").expect("BTC");
-        assert!(btc.networks.is_empty(), "无 chain = 合法状态，不是错误");
-        assert!(btc.deposit_enabled.is_none(), "字段缺失 = None，不臆造");
-    }
-
-    #[test]
-    fn test_parse_currencies_propagates_api_error() {
-        let response = json!({"code": "51001", "msg": "Parameter ccy error", "data": []});
-        assert!(matches!(
-            OkxParser::parse_currencies(&response),
-            Err(ExchangeError::Api { .. })
-        ));
     }
 
     #[test]

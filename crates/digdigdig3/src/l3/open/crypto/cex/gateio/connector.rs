@@ -3115,7 +3115,6 @@ impl GateioConnector {
 impl crate::core::traits::HasCapabilities for GateioConnector {
     fn capabilities(&self) -> crate::core::types::ConnectorCapabilities {
         crate::core::types::ConnectorCapabilities {
-            has_currency_info: false,
             has_ticker: true, has_orderbook: true, has_klines: true,
             has_recent_trades: true, has_exchange_info: true,
             // MarketDataPublic — real implementations

@@ -2987,7 +2987,6 @@ impl MarketDataPublic for BybitConnector {
 impl crate::core::traits::HasCapabilities for BybitConnector {
     fn capabilities(&self) -> crate::core::types::ConnectorCapabilities {
         crate::core::types::ConnectorCapabilities {
-            has_currency_info: false,
             // MarketData
             has_ticker: true,
             has_orderbook: true,

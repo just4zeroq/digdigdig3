@@ -1039,13 +1039,6 @@ pub struct ConnectorCapabilities {
     /// richer/deeper than raw trades — not where it is a raw-trade alias.
     pub has_agg_trades: bool,
     pub has_exchange_info: bool,
-    /// Public currency/asset reference endpoint (chains, deposit/withdraw flags).
-    ///
-    /// Distinct from `has_exchange_info`: this is the per-currency dictionary,
-    /// not the symbol dictionary. False where the venue has no **unauthenticated**
-    /// currency endpoint — e.g. Binance's coin config lives behind
-    /// `/sapi/v1/capital/config/getall`, which requires a signed request.
-    pub has_currency_info: bool,
 
     // ── MarketDataPublic ──────────────────────────────────────────────────────
     pub has_liquidation_history: bool,
