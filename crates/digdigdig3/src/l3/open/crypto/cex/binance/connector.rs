@@ -32,6 +32,7 @@ use crate::core::{
     SymbolInput,
 };
 use crate::core::types::{MarkPrice, TradeSide, AggTrade};
+use crate::core::types::CurrencyInfo;
 use crate::core::types::{
     ConnectorStats, SymbolInfo,
     TransferRequest, TransferHistoryFilter, TransferResponse,
@@ -1352,6 +1353,21 @@ impl MarketData for BinanceConnector {
         let symbols = BinanceParser::parse_exchange_info(&response, account_type)?;
         self.precision.load_from_symbols(&symbols);
         Ok(symbols)
+    }
+
+    /// Справочник валют — **wire-absent**, не TODO.
+    ///
+    /// Binance has no unauthenticated currency dictionary: the coin config
+    /// lives at `/sapi/v1/capital/config/getall`, which requires a signed
+    /// request. There is nothing to implement here without credentials —
+    /// hence `WireAbsent`, not `NotImplemented`. Declare this with
+    /// `ConnectorCapabilities::has_currency_info = false`.
+    async fn get_currencies(&self) -> ExchangeResult<Vec<CurrencyInfo>> {
+        Err(ExchangeError::WireAbsent(
+            "binance: no public currency endpoint — `/sapi/v1/capital/config/getall` requires \
+             a signed request; supply credentials or poll the symbol list instead"
+                .to_string(),
+        ))
     }
 
     fn market_data_capabilities(&self, _account_type: AccountType) -> MarketDataCapabilities {
@@ -3349,6 +3365,7 @@ impl MarketDataPublic for BinanceConnector {
 impl crate::core::traits::HasCapabilities for BinanceConnector {
     fn capabilities(&self) -> crate::core::types::ConnectorCapabilities {
         crate::core::types::ConnectorCapabilities {
+            has_currency_info: false,
             // MarketData
             has_ticker: true,
             has_orderbook: true,

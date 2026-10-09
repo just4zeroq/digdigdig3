@@ -2905,6 +2905,7 @@ impl AccountLedger for KuCoinConnector {
 impl crate::core::traits::HasCapabilities for KuCoinConnector {
     fn capabilities(&self) -> crate::core::types::ConnectorCapabilities {
         crate::core::types::ConnectorCapabilities {
+            has_currency_info: false,
             has_ticker: true, has_orderbook: true, has_klines: true,
             has_recent_trades: true, has_exchange_info: true,
             // recent_trades (/api/v1/market/histories) + funding_rate_history

@@ -39,6 +39,7 @@ use crate::core::types::{
 };
 use crate::core::types::OcoResponse;
 use crate::core::types::SymbolInfo;
+use crate::core::types::CurrencyInfo;
 use crate::core::traits::{
     ExchangeIdentity, MarketData, Trading, Account, Positions,
     CancelAll, AmendOrder, BatchOrders,
@@ -356,6 +357,12 @@ impl OkxConnector {
     /// Получить список символов (алиас для get_instruments для совместимости с тестами)
     pub async fn get_symbols(&self, account_type: AccountType) -> ExchangeResult<Vec<SymbolInfo>> {
         self.get_instruments(account_type).await
+    }
+
+    /// Получить справочник валют (`GET /api/v5/asset/currencies`, **без авторизации**).
+    pub async fn get_currency_list(&self) -> ExchangeResult<Vec<CurrencyInfo>> {
+        let response = self.get(OkxEndpoint::AssetCurrencies, HashMap::new()).await?;
+        OkxParser::parse_currencies(&response)
     }
 
     /// Получить server time
@@ -879,6 +886,11 @@ impl MarketData for OkxConnector {
         let symbols = self.get_instruments(account_type).await?;
         self.precision.load_from_symbols(&symbols);
         Ok(symbols)
+    }
+
+    /// Справочник валют — публичный endpoint, без токена.
+    async fn get_currencies(&self) -> ExchangeResult<Vec<CurrencyInfo>> {
+        self.get_currency_list().await
     }
 
     fn market_data_capabilities(&self, _account_type: AccountType) -> MarketDataCapabilities {
@@ -2706,6 +2718,7 @@ impl MarketDataPublic for OkxConnector {
 impl crate::core::traits::HasCapabilities for OkxConnector {
     fn capabilities(&self) -> crate::core::types::ConnectorCapabilities {
         crate::core::types::ConnectorCapabilities {
+            has_currency_info: true,
             // MarketData
             has_ticker: true,
             has_orderbook: true,

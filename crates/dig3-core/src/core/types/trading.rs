@@ -1206,6 +1206,50 @@ pub struct ExchangeInfo {
     pub symbols: Vec<SymbolInfo>,
 }
 
+/// Валюта / токен, доступный на бирже (референсные данные, не рыночные данные).
+///
+/// RAW contract, same rule as [`SymbolInfo`]: the typed fields are a convenience
+/// subset — `extra` carries the venue's native currency record verbatim so
+/// nothing the exchange said is lost. Aggregating per-chain rows into one
+/// per-currency row (OKX returns one row per chain) is a connector concern;
+/// mapping to a platform's own asset model is a STATION concern, never core.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CurrencyInfo {
+    /// Код валюты (`BTC`, `USDT`).
+    pub currency: String,
+    /// Отображаемое название (`Tether USD`), если биржа его отдаёт.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Доступные сети для депозита/вывода (`Trc20`, `Erc20`, ...).
+    ///
+    /// Deduplicated. Empty when the venue does not expose networks on this
+    /// endpoint — empty is a legal state, not an error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub networks: Vec<String>,
+    /// Точность (количество знаков после запятой), если биржа её отдаёт.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision: Option<u32>,
+    /// Разрешён ли депозит (`None` = биржа не сообщает на этом endpoint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deposit_enabled: Option<bool>,
+    /// Разрешён ли вывод (`None` = не сообщает).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdraw_enabled: Option<bool>,
+    /// RAW passthrough of the venue's native currency record, verbatim.
+    #[serde(default)]
+    pub extra: serde_json::Value,
+}
+
+impl CurrencyInfo {
+    /// Минимальный конструктор: только код валюты, остальное — serde-дефолты.
+    pub fn new(currency: impl Into<String>) -> Self {
+        CurrencyInfo {
+            currency: currency.into(),
+            ..Default::default()
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // MARGIN TYPES
 // ═══════════════════════════════════════════════════════════════════════════════

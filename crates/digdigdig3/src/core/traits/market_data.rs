@@ -5,7 +5,7 @@
 
 
 use crate::core::types::{
-    AccountType, ExchangeResult, Kline, MarketDataCapabilities, OrderBook, Price,
+    AccountType, CurrencyInfo, ExchangeResult, Kline, MarketDataCapabilities, OrderBook, Price,
     SymbolInfo, SymbolInput, Ticker,
 };
 
@@ -76,6 +76,24 @@ pub trait MarketData: ExchangeIdentity {
         let _ = account_type;
         Err(crate::core::types::ExchangeError::NotImplemented(
             "get_exchange_info not implemented for this connector".to_string(),
+        ))
+    }
+
+    /// Получить справочник валют/токенов биржи (сети, флаги депозита/вывода).
+    ///
+    /// Референсные данные, не рыночные: одна запись на валюту — не на символ.
+    /// Как и `get_exchange_info`, метод **публичный и не требует авторизации**;
+    /// коннекторы без публичного endpoint'а возвращают `NotSupported`
+    /// (биржа не предоставляет) — `NotImplemented` оставьте под TODO.
+    ///
+    /// Unauthenticated reference data, symmetric with `get_exchange_info`:
+    /// one record per **currency**, not per symbol. Connectors whose venue has
+    /// no public currency endpoint return `NotSupported` (the exchange does not
+    /// expose one), reserving `NotImplemented` for TODOs. Declare the matching
+    /// `ConnectorCapabilities::has_currency_info`.
+    async fn get_currencies(&self) -> ExchangeResult<Vec<CurrencyInfo>> {
+        Err(crate::core::types::ExchangeError::NotImplemented(
+            "get_currencies not implemented for this connector".to_string(),
         ))
     }
 

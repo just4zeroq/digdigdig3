@@ -1715,6 +1715,7 @@ fn interval_to_ms(interval: &str) -> u64 {
 impl crate::core::traits::HasCapabilities for LighterConnector {
     fn capabilities(&self) -> crate::core::types::ConnectorCapabilities {
         crate::core::types::ConnectorCapabilities {
+            has_currency_info: false,
             has_ticker: true, has_orderbook: true, has_klines: true,
             has_recent_trades: true, has_exchange_info: true,
             // MarketDataPublic: mark price klines wired (GET /markPriceCandles, market_id int quirk).

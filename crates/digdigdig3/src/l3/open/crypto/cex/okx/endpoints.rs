@@ -153,6 +153,10 @@ pub enum OkxEndpoint {
     AccountBillsArchive,
 
     // === CUSTODIAL FUNDS ===
+    /// GET /api/v5/asset/currencies — currency reference dictionary
+    /// (chains, deposit/withdraw flags). **Public, no auth** — unlike the
+    /// `/sapi/v1/capital/*` family on Binance, OKX exposes it unauthenticated.
+    AssetCurrencies,
     /// GET /api/v5/asset/deposit-address
     DepositAddress,
     /// POST /api/v5/asset/withdrawal
@@ -254,6 +258,7 @@ impl OkxEndpoint {
             Self::AccountBillsArchive => "/api/v5/account/bills-archive",
 
             // Custodial Funds
+            Self::AssetCurrencies => "/api/v5/asset/currencies",
             Self::DepositAddress => "/api/v5/asset/deposit-address",
             Self::Withdrawal => "/api/v5/asset/withdrawal",
             Self::DepositHistory => "/api/v5/asset/deposit-history",
@@ -296,7 +301,10 @@ impl OkxEndpoint {
             | Self::OpenInterestHistory
             | Self::TakerVolumeContract
             | Self::PositionTiers
-            | Self::LendingRateHistory => false,
+            | Self::LendingRateHistory
+            // ⚠ 必须列在这里：漏了会落到兜底 `_ => true`，`get()` 直接报
+            // `Auth required` —— 而这个端点本是公开的。
+            | Self::AssetCurrencies => false,
 
             // Private endpoints
             _ => true,
